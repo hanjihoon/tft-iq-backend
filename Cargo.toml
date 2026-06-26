@@ -3,13 +3,60 @@ name = "tft-iq-backend"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-# 비동기 런타임 (안정적인 서버 운영을 위한 필수 엔진)
-tokio = { version = "1.0", features = ["full"] }
+# 공유 코드는 lib 크레이트에 두고, 실행 파일(crawler/generator/server)이 가져다 씀.
+[lib]
+name = "tft_iq"
+path = "src/lib.rs"
 
-# HTTP 요청을 보내기 위한 라이브러리 (라이엇 API 호출용)
+[[bin]]
+name = "crawler"
+path = "src/bin/crawler.rs"
+
+[[bin]]
+name = "generator"
+path = "src/bin/generator.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# 비동기 런타임
+tokio = { version = "1", features = ["full"] }
+
+# 웹 프레임워크
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Riot API / 메타데이터 호출용 HTTP 클라이언트
 reqwest = { version = "0.12", features = ["json"] }
 
-# 라이엇이 주는 JSON 데이터를 Rust 구조체(Struct)로 변환해주는 라이브러리
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# DB (PostgreSQL, JSONB 컬럼 활용)
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "chrono",
+    "uuid",
+    "json",
+] }
+
+# 직렬화
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 유틸
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+rand = "0.8"
+
+# 로깅
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 설정
+dotenvy = "0.15"
+
+# Riot API rate limit 관리
+governor = "0.8"

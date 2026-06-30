@@ -29,6 +29,7 @@ struct AppState {
     pool: sqlx::PgPool,
 }
 
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -49,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/me/{puuid}/weakness", get(user_weakness))
         .route("/api/quiz/item", get(item_quiz))
         .route("/api/quiz/{id}/answer", post(answer_quiz))
+        .route("/api/quiz/next", get(next_unsolved))
+        .route("/api/meta/info", get(meta_info_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -202,6 +205,7 @@ async fn item_quiz(State(st): State<AppState>) -> Result<Json<PuzzleView>, ApiEr
 async fn answer_quiz(
     State(st): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AttemptReq>,
 ) -> Result<Json<AttemptResp>, ApiError> {
     let (answer, stats) = db::puzzle_answer(&st.pool, id)
@@ -210,10 +214,47 @@ async fn answer_quiz(
 
     let correct = req.chosen == answer;
 
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
     if let Some(puuid) = req.user_puuid.as_deref() {
         db::ensure_user(&st.pool, puuid, None).await?;
-        db::record_attempt(&st.pool, puuid, id, &req.chosen, correct).await?;
+        db::record_attempt(&st.pool, user_id, id, &req.chosen, correct).await?;
     }
 
     Ok(Json(AttemptResp { correct, answer, stats }))
+}
+
+/// 안 푼 퀴즈 하나. 헤더 X-User-Id로 익명 유저 식별.
+async fn next_unsolved(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = headers
+        .get("X-User-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anon");
+
+    match db::unsolved_item_puzzle(&st.pool, user_id, 100).await? {
+        Some(p) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "puzzle": {
+                "id": p.id, "patch": p.patch,
+                "prompt": p.prompt, "options": p.options,
+            }
+        }))),
+        // 다 품 → 프론트가 "오늘의 문제 완료" 화면
+        None => Ok(Json(serde_json::json!({ "status": "all_solved" }))),
+    }
+}
+
+async fn meta_info_handler(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let m = db::meta_info(&st.pool).await?;
+    // 표본 수로 "상위 N위" 추정 (티어 풀과 연동)
+    let approx_rank = if m.total_matches >= 3000 { "상위 ~1500위" } else { "상위 ~1500위 (수집 중)" };
+    Ok(Json(serde_json::json!({
+        "patch": m.patch,
+        "total_matches": m.total_matches,
+        "puzzle_count": m.puzzle_count,
+        "approx_rank": approx_rank,
+        "region": "한국 서버",
+    })))
 }

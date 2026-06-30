@@ -1,28 +1,34 @@
-//! 아이템 BIS 퀴즈 생성기.
+//! 아이템 BIS 퀴즈 생성기 (캐리 타입 + 계열 일치 오답).
 //!
-//! 로직:
-//!   1) carry_candidates로 충분히 등장한 딜 캐리 목록
-//!   2) 각 캐리마다 item_stats_for_carry로 BIS(평균 등수 최저) 아이템
-//!   3) 정답 = BIS, 오답 = 다른 캐리들의 인기 아이템 중 이 캐리가 잘 안 쓰는 것
-//!   4) 보기 4개 셔플 → puzzles 테이블에 저장
+//! 난이도 정책:
+//!   dealer  → 오답을 정답과 같은 계열에서만 (AD캐리=AD오답) → 소거 불가, 어려움
+//!   bruiser → 오답에 딜템 + 브루저/방어템 혼합 → "딜 vs 탱" 트레이드오프
+//!   tank/애매 → 제외 (정체성 불명확)
+//!
+//! 정답은 항상 데이터(BIS 1위)가 정한다. 계열은 "오답 풀"에만 관여.
 //!
 //! 실행:  cargo run --bin item_quiz_gen
 
 use std::collections::HashSet;
 
 use rand::seq::SliceRandom;
+use tft_iq::db::{self, CarryType};
 use tft_iq::{
-    Config, db,
+    Config,
     meta::Meta,
-    puzzle::{ItemOptionStat, ItemPrompt, NamedRef, OptionItem, PuzzleKind},
+    puzzle::{ItemOptionStat, ItemPrompt, NamedRef, OptionItem},
 };
 
-/// 캐리로 인정할 최소 등장 수
-const MIN_CARRY_APPEARANCES: i64 = 20;
-/// BIS 후보로 인정할 아이템의 최소 픽 수
+const MIN_CARRY_APPEARANCES: i64 = 30;
+const SHRINK_C: f64 = 25.0; // 수축 강도 (가상 사전표본 개수)
+const MIN_LIFT: f64 = 2.0;    // 풀템 기준 lift. 이 미만은 범용템 → 제외
 const MIN_ITEM_PICKS: i64 = 10;
-/// 캐리당 만들 퀴즈 수 (보통 1개)
-const PUZZLES_PER_CARRY: usize = 1;
+
+
+fn adjusted(avg: f64, picks: i64, prior_mean: f64) -> f64 {
+    (avg * picks as f64 + prior_mean * SHRINK_C) / (picks as f64 + SHRINK_C)
+}
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,137 +40,171 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&cfg.database_url).await?;
 
     let Some(info) = db::current_patch_info(&pool).await? else {
-        eprintln!("패치 데이터 없음. crawler를 먼저 실행해라.");
+        eprintln!("패치 데이터 없음.");
         return Ok(());
     };
     let (set_number, patch) = (info.set_number, info.patch.clone());
-    eprintln!("대상: set {set_number}, patch {patch} ({:.1}일차)", info.age_days);
+    eprintln!("대상: set {set_number}, patch {patch}");
 
     let meta = Meta::load(set_number).await?;
+    let mut rng = rand::thread_rng();
 
-    // 1) 딜 캐리 목록
     let carries = db::carry_candidates(&pool, set_number, &patch, MIN_CARRY_APPEARANCES).await?;
     eprintln!("캐리 후보 {}종", carries.len());
-    if carries.is_empty() {
-        eprintln!("캐리가 없음. 데이터를 더 모아라.");
-        return Ok(());
-    }
 
-    // 모든 캐리의 BIS를 미리 구해 오답 풀로도 활용
-    // (캐리 id -> 그 캐리의 아이템 통계)
-    let mut all_best: Vec<(String, db::ItemStat)> = Vec::new();
-    for (carry_id, _) in &carries {
-        let stats = db::item_stats_for_carry(&pool, set_number, &patch, carry_id, MIN_ITEM_PICKS).await?;
-        if let Some(best) = stats.first() {
-            all_best.push((carry_id.clone(), best.clone()));
-        }
-    }
-
-    let mut rng = rand::thread_rng();
-    let mut made = 0usize;
+    let mut made = 0;
+    let mut skipped_tank = 0;
 
     for (carry_id, appearances) in &carries {
-        let stats = db::item_stats_for_carry(&pool, set_number, &patch, carry_id, MIN_ITEM_PICKS).await?;
-        if stats.len() < 4 {
-            continue; // 보기 4개를 못 채우면 스킵
+        // 1) 캐리 타입 판정
+        let types = db::carry_item_types(&pool, set_number, &patch, carry_id, MIN_ITEM_PICKS, 50).await?;
+        let carry_type = db::classify_carry(&types);
+        if carry_type == CarryType::Tank {
+            skipped_tank += 1;
+            continue; // 순수 탱커/애매 캐리 제외
         }
 
-        // 정답 = 평균 등수 최저(이미 ORDER BY avg_place ASC라 first)
-        let best = stats[0].clone();
-
-        // 이 캐리가 실제로 든 아이템 집합 (오답 중복 방지용)
-        let own_items: HashSet<&str> = stats.iter().map(|s| s.item.as_str()).collect();
-
-        // 오답 풀: 다른 캐리들의 BIS 중 이 캐리가 잘 안 쓰는 아이템
-        let mut distractor_pool: Vec<String> = all_best
-            .iter()
-            .filter(|(cid, _)| cid != carry_id)
-            .map(|(_, st)| st.item.clone())
-            .filter(|item| !own_items.contains(item.as_str()))
-            .collect();
-        distractor_pool.sort();
-        distractor_pool.dedup();
-
-        // 오답 풀이 부족하면 이 캐리의 하위 아이템(평균 등수 나쁜 것)으로 보충
-        if distractor_pool.len() < 3 {
-            for s in stats.iter().rev().take(3) {
-                if s.item != best.item && !distractor_pool.contains(&s.item) {
-                    distractor_pool.push(s.item.clone());
-                }
-            }
-        }
-
-        let distractors: Vec<String> = distractor_pool
-            .choose_multiple(&mut rng, 3)
-            .cloned()
-            .collect();
-        if distractors.len() < 3 {
+        
+        
+        let all = db::carry_item_full(&pool, set_number, &patch, carry_id, MIN_ITEM_PICKS).await?;
+        if all.is_empty() {
             continue;
         }
+        let prior = all[0].carry_mean;
 
-        // 보기 구성 + 셔플
-        let mut option_ids = vec![best.item.clone()];
-        option_ids.extend(distractors);
-        option_ids.shuffle(&mut rng);
+        // lift >= 2.0 인 것만 정답 후보 (범용템 제외)
+        let mut candidates: Vec<_> = all.iter().filter(|s| s.lift >= MIN_LIFT).cloned().collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        // 베이지안 보정 평균으로 정렬 → 1위 정답
+        candidates.sort_by(|a, b| {
+            adjusted(a.avg_placement, a.picks, prior)
+                .partial_cmp(&adjusted(b.avg_placement, b.picks, prior))
+                .unwrap()
+        });
+        let answer = candidates[0].clone();
 
-        // 보기/통계 직렬화
-        let options: Vec<OptionItem> = option_ids
-            .iter()
-            .map(|id| OptionItem {
-                id: id.clone(),
-                name: meta.item_name(id),
+        // 숨은 픽: 정답 아니면서 lift 충분 + 픽률 낮(정답의 60% 미만) + 보정평균 좋은 것
+        let hidden = candidates.iter()
+            .skip(1)
+            .filter(|s| s.picks < answer.picks * 60 / 100)
+            .min_by(|a, b| {
+                adjusted(a.avg_placement, a.picks, prior)
+                    .partial_cmp(&adjusted(b.avg_placement, b.picks, prior))
+                    .unwrap()
             })
+            .cloned();
+
+
+        // 3) 오답 허용 계열 결정
+        let allowed: HashSet<&str> = allowed_distractor_types(carry_type, &answer.damage_type)
+            .into_iter()
             .collect();
 
-        // 보기별 통계: 이 캐리 기준 평균 등수 (없으면 null)
-        let option_stats: Vec<ItemOptionStat> = option_ids
+        // 4) 오답 후보: 먼저 이 캐리의 다른 아이템(같은 허용 계열)
+        let mut distractors: Vec<(String, String)> = candidates
             .iter()
-            .map(|id| {
-                let st = stats.iter().find(|s| &s.item == id);
+            .filter(|s| s.item != answer.item)
+            .filter(|s| allowed.contains(s.damage_type.as_str()))
+            .map(|s| (s.item.clone(), s.name.clone()))
+            .collect();
+
+        // 5) 부족하면 전역 계열 풀에서 보충
+        if distractors.len() < 3 {
+            let types_vec: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+            let mut pool_items = db::items_by_damage_type(&pool, &types_vec).await?;
+            pool_items.shuffle(&mut rng);
+            for (id, name) in pool_items {
+                if distractors.len() >= 3 {
+                    break;
+                }
+                if id == answer.item || distractors.iter().any(|(d, _)| d == &id) {
+                    continue;
+                }
+                distractors.push((id, name));
+            }
+        }
+        if distractors.len() < 3 {
+            continue; // 오답 4개 못 채우면 스킵
+        }
+
+        // 6) 보기 구성 (정답 + 오답 3개) 셔플
+        distractors.truncate(3);
+        let mut opts: Vec<(String, String)> = vec![(answer.item.clone(), answer.name.clone())];
+        opts.extend(distractors);
+        opts.shuffle(&mut rng);
+
+        let options: Vec<OptionItem> = opts
+            .iter()
+            .map(|(id, name)| OptionItem { id: id.clone(), name: name.clone() })
+            .collect();
+
+        // 보기별 통계 (이 캐리 기준, 없으면 null)
+        let option_stats: Vec<ItemOptionStat> = opts
+            .iter()
+            .map(|(id, name)| {
+                let st = all.iter().find(|s| &s.item == id);
                 ItemOptionStat {
                     id: id.clone(),
-                    name: meta.item_name(id),
+                    name: name.clone(),
                     avg_placement: st.map(|s| (s.avg_placement * 100.0).round() / 100.0),
                     sample_size: st.map(|s| s.picks).unwrap_or(0),
-                    is_best: *id == best.item,
+                    is_best: *id == answer.item,
                 }
             })
             .collect();
 
         let prompt = ItemPrompt {
             question: format!("{} 캐리에게 가장 좋은 아이템은?", meta.unit_name(carry_id)),
-            carry: NamedRef {
-                id: carry_id.clone(),
-                name: meta.unit_name(carry_id),
-            },
+            carry: NamedRef { id: carry_id.clone(), name: meta.unit_name(carry_id) },
             context_traits: Vec::new(),
             patch: patch.clone(),
         };
-
         let stats_payload = serde_json::json!({
             "options": option_stats,
             "carry_appearances": appearances,
+            "carry_type": carry_type_str(carry_type),
+            "hidden_pick": hidden.as_ref().map(|h| serde_json::json!({
+                "id": h.item,
+                "name": h.name,
+                "avg_placement": (h.avg_placement * 100.0).round() / 100.0,
+                "sample_size": h.picks,
+            })),
         });
 
-        db::insert_puzzle(
-            &pool,
-            PuzzleKind::ItemCombine.as_str(),
-            set_number,
-            &patch,
-            &serde_json::to_value(&prompt)?,
-            &serde_json::to_value(&options)?,
-            &best.item, // 정답 = BIS 아이템 id
-            &stats_payload,
-            None,                    // "" → None
-        )
-        .await?;
-
+        db::insert_item_puzzle(
+            &pool, set_number, &patch, carry_id, carry_type_str(carry_type),
+            &serde_json::to_value(&prompt)?, &serde_json::to_value(&options)?,
+            &answer.item, &stats_payload,
+        ).await?;
         made += 1;
-        if made >= carries.len() * PUZZLES_PER_CARRY {
-            break;
-        }
     }
 
-    eprintln!("아이템 BIS 퀴즈 {made}개 생성 완료");
+    eprintln!("아이템 퀴즈 {made}개 생성 (탱커/애매 {skipped_tank}종 제외)");
     Ok(())
+}
+
+/// 캐리 타입 + 정답 계열 → 오답으로 허용할 계열 목록.
+fn allowed_distractor_types<'a>(carry: CarryType, answer_type: &'a str) -> Vec<&'a str> {
+    match carry {
+        // 브루저: 딜템 + 방어/브루저템 혼합 (딜 vs 탱 트레이드오프가 문제의 핵심)
+        CarryType::Bruiser => vec!["ad", "ap", "mixed", "bruiser", "tank"],
+        // 딜러: 정답과 같은 계열로 제한 (mixed는 양쪽에 호환)
+        _ => match answer_type {
+            "ad" => vec!["ad", "mixed"],
+            "ap" => vec!["ap", "mixed"],
+            "mixed" => vec!["ad", "ap", "mixed"],
+            // 정답이 util/방어 계열이면(드묾) 딜템들로 변별
+            other => vec!["ad", "ap", "mixed", other],
+        },
+    }
+}
+
+fn carry_type_str(t: CarryType) -> &'static str {
+    match t {
+        CarryType::Dealer => "dealer",
+        CarryType::Bruiser => "bruiser",
+        CarryType::Tank => "tank",
+    }
 }

@@ -291,28 +291,6 @@ pub async fn ensure_user(pool: &PgPool, puuid: &str, riot_id: Option<&str>) -> R
     Ok(())
 }
 
-pub async fn record_attempt(
-    pool: &PgPool,
-    user_puuid: &str,
-    puzzle_id: Uuid,
-    chosen: &str,
-    correct: bool,
-) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO puzzle_attempts (user_puuid, puzzle_id, chosen, correct)
-        VALUES ($1, $2, $3, $4)
-        "#,
-    )
-    .bind(user_puuid)
-    .bind(puzzle_id)
-    .bind(chosen)
-    .bind(correct)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// 퍼즐 타입별 정답률 → 약점 분석.
 /// 반환: (puzzle_type, 시도수, 정답수)
 pub async fn user_weakness(pool: &PgPool, puuid: &str) -> Result<Vec<(String, i64, i64)>> {
@@ -448,11 +426,24 @@ pub async fn carry_candidates(
 #[derive(Debug, Clone)]
 pub struct ItemStat {
     pub item: String,
+    pub name: String,
     pub avg_placement: f64,
     pub picks: i64,
+    pub damage_type: String,
+    pub carry_mean: f64,   // 이 캐리의 전체 평균등수 (수축 기준점)
 }
 
-/// 특정 캐리가 든 아이템별 평균 등수 (낮을수록 BIS).
+#[derive(Debug, Clone)]
+pub struct ItemFull {
+    pub item: String,
+    pub name: String,
+    pub avg_placement: f64,
+    pub picks: i64,
+    pub damage_type: String,
+    pub carry_mean: f64,
+    pub lift: f64,
+}
+
 pub async fn item_stats_for_carry(
     pool: &PgPool,
     set_number: i32,
@@ -460,41 +451,95 @@ pub async fn item_stats_for_carry(
     character_id: &str,
     min_picks: i64,
 ) -> Result<Vec<ItemStat>> {
-    let rows: Vec<(String, f64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, String, f64, i64, String, f64)> = sqlx::query_as(
         r#"
-        SELECT item,
-               AVG(placement)::float8 AS avg_place,
-               COUNT(*)::int8         AS picks
-        FROM (
-          SELECT (p->>'placement')::int                     AS placement,
-                 jsonb_array_elements_text(u->'itemNames')  AS item
+        WITH item_rows AS (
+          SELECT (p->>'placement')::int                    AS placement,
+                 jsonb_array_elements_text(u->'itemNames') AS item
           FROM raw_matches m,
                jsonb_array_elements(m.raw->'info'->'participants') AS p,
                jsonb_array_elements(p->'units')                    AS u
-          WHERE m.set_number = $1
-            AND m.patch = $2
+          WHERE m.set_number = $1 AND m.patch = $2
             AND u->>'character_id' = $3
-            AND jsonb_array_length(u->'itemNames') >= 2
-        ) t
-        JOIN item_classifications ic ON ic.item_id = t.item   -- ★ 추가: 정상 완성템만
-        GROUP BY item
+            AND jsonb_array_length(u->'itemNames') >= 3
+        )
+        SELECT t.item, ic.name,
+               AVG(t.placement)::float8 AS avg_place,
+               COUNT(*)::int8           AS picks,
+               ic.damage_type,
+               (SELECT AVG(placement)::float8 FROM item_rows) AS carry_mean
+        FROM item_rows t
+        JOIN item_classifications ic ON ic.item_id = t.item
+        GROUP BY t.item, ic.name, ic.damage_type
         HAVING COUNT(*) >= $4
         ORDER BY avg_place ASC
         "#,
     )
-    .bind(set_number)
-    .bind(patch)
-    .bind(character_id)
-    .bind(min_picks)
-    .fetch_all(pool)
-    .await?;
+    .bind(set_number).bind(patch).bind(character_id).bind(min_picks)
+    .fetch_all(pool).await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|(item, avg_placement, picks)| ItemStat {
-            item,
-            avg_placement,
-            picks,
+    Ok(rows.into_iter()
+        .map(|(item, name, avg_placement, picks, damage_type, carry_mean)| ItemStat {
+            item, name, avg_placement, picks, damage_type, carry_mean,
+        })
+        .collect())
+}
+
+/// 캐리의 아이템별 통계 + lift (시그니처 정도).
+/// lift = (이 캐리가 이 아이템 들 비율) / (전체에서 이 아이템 들 비율)
+pub async fn carry_item_full(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    character_id: &str,
+    min_picks: i64,
+) -> Result<Vec<ItemFull>> {
+    let rows: Vec<(String, String, f64, i64, String, f64, f64)> = sqlx::query_as(
+        r#"
+        WITH carry_rows AS (
+          SELECT (p->>'placement')::int                    AS placement,
+                 jsonb_array_elements_text(u->'itemNames') AS item
+          FROM raw_matches m,
+               jsonb_array_elements(m.raw->'info'->'participants') AS p,
+               jsonb_array_elements(p->'units')                    AS u
+          WHERE m.set_number = $1 AND m.patch = $2
+            AND u->>'character_id' = $3
+            AND jsonb_array_length(u->'itemNames') >= 3
+        ),
+        carry_total AS (SELECT COUNT(*)::float8 AS n FROM carry_rows),
+        all_rows AS (
+          SELECT jsonb_array_elements_text(u->'itemNames') AS item
+          FROM raw_matches m,
+               jsonb_array_elements(m.raw->'info'->'participants') AS p,
+               jsonb_array_elements(p->'units')                    AS u
+          WHERE m.set_number = $1 AND m.patch = $2
+            AND jsonb_array_length(u->'itemNames') >= 3
+        ),
+        all_total AS (SELECT COUNT(*)::float8 AS n FROM all_rows),
+        item_overall AS (
+          SELECT item, COUNT(*)::float8 AS appears FROM all_rows GROUP BY item
+        )
+        SELECT t.item, ic.name,
+               AVG(t.placement)::float8 AS avg_place,
+               COUNT(*)::int8           AS picks,
+               ic.damage_type,
+               (SELECT AVG(placement)::float8 FROM carry_rows) AS carry_mean,
+               ( (COUNT(*)::float8 / (SELECT n FROM carry_total)) /
+                 NULLIF(io.appears / (SELECT n FROM all_total), 0) ) AS lift
+        FROM carry_rows t
+        JOIN item_classifications ic ON ic.item_id = t.item
+        JOIN item_overall io ON io.item = t.item
+        GROUP BY t.item, ic.name, ic.damage_type, io.appears
+        HAVING COUNT(*) >= $4
+        ORDER BY avg_place ASC
+        "#,
+    )
+    .bind(set_number).bind(patch).bind(character_id).bind(min_picks)
+    .fetch_all(pool).await?;
+
+    Ok(rows.into_iter()
+        .map(|(item, name, avg_placement, picks, damage_type, carry_mean, lift)| ItemFull {
+            item, name, avg_placement, picks, damage_type, carry_mean, lift,
         })
         .collect())
 }
@@ -507,21 +552,24 @@ pub async fn upsert_item_classification(
     name: &str,
     category: &str,
     is_damage: bool,
+    damage_type: &str,   // 추가
 ) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO item_classifications (item_id, name, category, is_damage)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO item_classifications (item_id, name, category, is_damage, damage_type)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (item_id) DO UPDATE
           SET name = EXCLUDED.name,
               category = EXCLUDED.category,
-              is_damage = EXCLUDED.is_damage
+              is_damage = EXCLUDED.is_damage,
+              damage_type = EXCLUDED.damage_type
         "#,
     )
     .bind(item_id)
     .bind(name)
     .bind(category)
     .bind(is_damage)
+    .bind(damage_type)   // 추가
     .execute(pool)
     .await?;
     Ok(())
@@ -553,4 +601,265 @@ pub async fn random_item_puzzle(
     .fetch_optional(pool)
     .await?;
     Ok(row)
+}
+
+/// 현재 패치(가장 최근)의 16.x 매치 수. 티어 풀 결정에 쓴다.
+pub async fn current_patch_match_count(pool: &PgPool) -> Result<i64> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT match_count::int8
+        FROM patch_versions
+        ORDER BY earliest_game_datetime DESC NULLS LAST
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    // 패치 데이터가 아직 없으면 0
+    Ok(row.map(|(c,)| c).unwrap_or(0))
+}
+
+/// 현재 패치의 "조회 시작 시각"(epoch seconds).
+/// earliest_game_datetime에서 안전 마진(12시간)을 빼서 경계 누락을 막는다.
+/// 패치 데이터가 아직 없으면 None → 첫 수집은 startTime 없이 돌린다.
+pub async fn current_patch_start_time(pool: &PgPool) -> Result<Option<i64>> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        r#"
+        SELECT (EXTRACT(EPOCH FROM earliest_game_datetime)::int8 - 12 * 3600)
+        FROM patch_versions
+        ORDER BY earliest_game_datetime DESC NULLS LAST
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    // 이중 Option: 행이 없거나(fetch_optional None), earliest가 NULL이거나(내부 None)
+    Ok(row.and_then(|(t,)| t))
+}
+
+/// 플레이어의 마지막 수집 시각을 epoch seconds로. 아직 없으면 None.
+pub async fn player_last_crawled_epoch(pool: &PgPool, puuid: &str) -> Result<Option<i64>> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM last_crawled_at)::int8 FROM tracked_players WHERE puuid = $1",
+    )
+    .bind(puuid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(t,)| t))
+}
+
+
+/// 캐리가 자주 든 아이템의 damage_type 분포 (BIS 상위 N개 기준).
+/// 반환: (damage_type, 평균등수, 픽수) 리스트 — 평균등수 오름차순.
+pub async fn carry_item_types(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    character_id: &str,
+    min_picks: i64,
+    top_n: i64,
+) -> Result<Vec<(String, f64, i64)>> {
+    let rows: Vec<(String, f64, i64)> = sqlx::query_as(
+        r#"
+        SELECT ic.damage_type,
+               AVG(t.placement)::float8 AS avg_place,
+               COUNT(*)::int8           AS picks
+        FROM (
+          SELECT (p->>'placement')::int                    AS placement,
+                 jsonb_array_elements_text(u->'itemNames') AS item
+          FROM raw_matches m,
+               jsonb_array_elements(m.raw->'info'->'participants') AS p,
+               jsonb_array_elements(p->'units')                    AS u
+          WHERE m.set_number = $1
+            AND m.patch = $2
+            AND u->>'character_id' = $3
+            AND jsonb_array_length(u->'itemNames') >= 2
+        ) t
+        JOIN item_classifications ic ON ic.item_id = t.item
+        GROUP BY ic.damage_type, t.item
+        HAVING COUNT(*) >= $4
+        ORDER BY avg_place ASC
+        LIMIT $5
+        "#,
+    )
+    .bind(set_number)
+    .bind(patch)
+    .bind(character_id)
+    .bind(min_picks)
+    .bind(top_n)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CarryType {
+    Dealer,
+    Bruiser,
+    Tank,
+}
+
+/// BIS 상위 아이템의 계열 구성으로 캐리 타입 판정.
+/// types: carry_item_types가 준 (damage_type, avg_place, picks) 상위 리스트.
+pub fn classify_carry(types: &[(String, f64, i64)]) -> CarryType {
+    let mut dmg = 0i64;
+    let mut bruiser = 0i64;
+    let mut tank = 0i64;
+
+    // 평균등수 상위 N개가 아니라, 계열별 픽 수를 전부 합산
+    for (dt, _, picks) in types {
+        match dt.as_str() {
+            "ad" | "ap" | "mixed" => dmg += picks,
+            "bruiser" => bruiser += picks,
+            "tank" => tank += picks,
+            _ => {} // utility 중립
+        }
+    }
+
+    let total = dmg + bruiser + tank;
+    if total == 0 {
+        return CarryType::Tank;
+    }
+
+    // 브루저 비중이 의미있게 높으면(25%+) 브루저로 — 딜+탱 겸용 강조
+    if bruiser * 100 / total >= 25 {
+        CarryType::Bruiser
+    } else if tank > dmg && tank > bruiser {
+        CarryType::Tank // 탱이 압도적 → 제외
+    } else {
+        CarryType::Dealer
+    }
+}
+
+/// 지정한 계열들의 모든 분류된 아이템 (오답 풀 보충용).
+pub async fn items_by_damage_type(
+    pool: &PgPool,
+    types: &[String],
+) -> Result<Vec<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_id, name FROM item_classifications WHERE damage_type = ANY($1)",
+    )
+    .bind(types)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn insert_item_puzzle(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    carry_id: &str,
+    carry_type: &str,
+    prompt: &serde_json::Value,
+    options: &serde_json::Value,
+    answer: &str,
+    stats: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO puzzles
+            (puzzle_type, set_number, patch, carry_id, variant, carry_type,
+             prompt, options, answer, stats, source_match_id)
+        VALUES ('item_combine', $1, $2, $3, 'bis', $4, $5, $6, $7, $8, NULL)
+        ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL
+        DO UPDATE SET
+            carry_type = EXCLUDED.carry_type,
+            prompt     = EXCLUDED.prompt,
+            options    = EXCLUDED.options,
+            answer     = EXCLUDED.answer,
+            stats      = EXCLUDED.stats,
+            set_number = EXCLUDED.set_number
+        "#,
+    )
+    .bind(set_number).bind(patch).bind(carry_id).bind(carry_type)
+    .bind(prompt).bind(options).bind(answer).bind(stats)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// item_combine 퍼즐 전체 삭제 (재생성 전 호출).
+pub async fn clear_item_puzzles(pool: &PgPool) -> Result<()> {
+    sqlx::query("DELETE FROM puzzles WHERE puzzle_type = 'item_combine'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 시도 기록 (정답 여부 포함).
+pub async fn record_attempt(
+    pool: &PgPool,
+    user_id: &str,
+    puzzle_id: uuid::Uuid,
+    chosen: &str,
+    correct: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO puzzle_attempts (user_id, puzzle_id, chosen, correct) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(puzzle_id)
+    .bind(chosen)
+    .bind(correct)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 이 유저가 아직 안 푼 아이템 퍼즐 하나 (랜덤).
+/// 다 풀었으면 None → 프론트가 "다 풀었어요" 처리.
+pub async fn unsolved_item_puzzle(
+    pool: &PgPool,
+    user_id: &str,
+    min_sample: i64,
+) -> Result<Option<PuzzleRow>> {
+    let row: Option<PuzzleRow> = sqlx::query_as(
+        r#"
+        SELECT id, puzzle_type, patch, set_number, prompt, options, stats
+        FROM puzzles p
+        WHERE p.puzzle_type = 'item_combine'
+          AND (
+            SELECT (o->>'sample_size')::int
+            FROM jsonb_array_elements(p.stats->'options') o
+            WHERE (o->>'is_best')::bool = true
+          ) >= $2
+          AND NOT EXISTS (
+            SELECT 1 FROM puzzle_attempts a
+            WHERE a.user_id = $1 AND a.puzzle_id = p.id
+          )
+        ORDER BY random()
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(min_sample)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// 전역 메타 정보 (분석 표본 출처).
+pub struct MetaInfo {
+    pub patch: String,
+    pub total_matches: i64,
+    pub puzzle_count: i64,
+}
+
+pub async fn meta_info(pool: &PgPool) -> Result<MetaInfo> {
+    let (patch, total): (String, i64) = sqlx::query_as(
+        r#"SELECT patch, match_count::int8 FROM patch_versions
+           ORDER BY earliest_game_datetime DESC NULLS LAST LIMIT 1"#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or_else(|| ("?".into(), 0));
+
+    let (pc,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::int8 FROM puzzles WHERE puzzle_type='item_combine'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(MetaInfo { patch, total_matches: total, puzzle_count: pc })
 }

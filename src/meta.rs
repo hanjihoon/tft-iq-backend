@@ -15,10 +15,10 @@ pub struct UnitMeta {
 }
 
 pub struct Meta {
-    /// apiName → 한글 (예: "TFT17_Augment_..." → "...")
     pub augments: HashMap<String, String>,
     pub units: HashMap<String, UnitMeta>,
     pub items: HashMap<String, String>,
+    pub traits: HashMap<String, String>,   // apiName → 한글 (예: TFT17_Divine → 신성)
 }
 
 impl Meta {
@@ -51,11 +51,27 @@ impl Meta {
         }
 
         // 세트별 챔피언은 "setData" 배열에서 number로 찾는다.
+        // 세트별 챔피언 + 특성은 "setData" 배열에서 number로 찾는다.
         let mut units = HashMap::new();
+        let mut traits = HashMap::new();
         if let Some(sets) = v.get("setData").and_then(|x| x.as_array()) {
             for s in sets {
                 if s.get("number").and_then(|n| n.as_i64()) != Some(set_number as i64) {
                     continue;
+                }
+                // 이 세트의 특성 한글명
+                if let Some(tr) = s.get("traits").and_then(|x| x.as_array()) {
+                    for t in tr {
+                        let (Some(id), Some(name)) = (
+                            t.get("apiName").and_then(|x| x.as_str()),
+                            t.get("name").and_then(|x| x.as_str()),
+                        ) else {
+                            continue;
+                        };
+                        if !name.is_empty() {
+                            traits.insert(id.to_string(), name.to_string());
+                        }
+                    }
                 }
                 if let Some(champs) = s.get("champions").and_then(|c| c.as_array()) {
                     for c in champs {
@@ -82,6 +98,7 @@ impl Meta {
             augments,
             units,
             items,
+            traits,
         })
     }
 
@@ -102,5 +119,9 @@ impl Meta {
 
     pub fn item_name(&self, id: &str) -> String {
         self.items.get(id).cloned().unwrap_or_else(|| id.to_string())
+    }
+
+    pub fn trait_name(&self, id: &str) -> String {
+        self.traits.get(id).cloned().unwrap_or_else(|| id.to_string())
     }
 }

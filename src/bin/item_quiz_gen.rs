@@ -137,7 +137,11 @@ async fn main() -> anyhow::Result<()> {
 
         let options: Vec<OptionItem> = opts
             .iter()
-            .map(|(id, name)| OptionItem { id: id.clone(), name: name.clone() })
+            .map(|(id, name)| OptionItem {
+                id: id.clone(),
+                name: name.clone(),
+                icon: all.iter().find(|s| &s.item == id).map(|s| s.icon_url.clone()).unwrap_or_default(),
+            })
             .collect();
 
         // 보기별 통계 (이 캐리 기준, 없으면 null)

@@ -10,8 +10,9 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, Query},
     http::StatusCode,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -226,19 +227,22 @@ async fn answer_quiz(
 /// 안 푼 퀴즈 하나. 헤더 X-User-Id로 익명 유저 식별.
 async fn next_unsolved(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user_id = headers
-        .get("X-User-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("anon");
-
-    match db::unsolved_item_puzzle(&st.pool, user_id, 100).await? {
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    // ?type=item_combine | deck_complete, 기본은 item_combine
+    let ptype = q.get("type").map(|s| s.as_str()).unwrap_or("item_combine");
+    match db::unsolved_puzzle_by_type(&st.pool, user_id, ptype).await? {
         Some(p) => Ok(Json(serde_json::json!({
             "status": "ok",
             "puzzle": {
-                "id": p.id, "patch": p.patch,
-                "prompt": p.prompt, "options": p.options,
+                "id": p.id,
+                "type": p.puzzle_type,       // "item_combine" | "deck_complete"
+                "patch": p.patch,
+                "prompt": p.prompt,
+                "options": p.options,
+                "stats": p.stats
             }
         }))),
         // 다 품 → 프론트가 "오늘의 문제 완료" 화면

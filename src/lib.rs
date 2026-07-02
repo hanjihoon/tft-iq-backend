@@ -3,6 +3,7 @@
 pub mod comp;
 pub mod config;
 pub mod db;
+pub mod deck_cluster;
 pub mod error;
 pub mod meta;
 pub mod puzzle;

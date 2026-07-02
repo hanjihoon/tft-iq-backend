@@ -424,16 +424,6 @@ pub async fn carry_candidates(
 }
 
 #[derive(Debug, Clone)]
-pub struct ItemStat {
-    pub item: String,
-    pub name: String,
-    pub avg_placement: f64,
-    pub picks: i64,
-    pub damage_type: String,
-    pub carry_mean: f64,   // 이 캐리의 전체 평균등수 (수축 기준점)
-}
-
-#[derive(Debug, Clone)]
 pub struct ItemFull {
     pub item: String,
     pub name: String,
@@ -442,47 +432,7 @@ pub struct ItemFull {
     pub damage_type: String,
     pub carry_mean: f64,
     pub lift: f64,
-}
-
-pub async fn item_stats_for_carry(
-    pool: &PgPool,
-    set_number: i32,
-    patch: &str,
-    character_id: &str,
-    min_picks: i64,
-) -> Result<Vec<ItemStat>> {
-    let rows: Vec<(String, String, f64, i64, String, f64)> = sqlx::query_as(
-        r#"
-        WITH item_rows AS (
-          SELECT (p->>'placement')::int                    AS placement,
-                 jsonb_array_elements_text(u->'itemNames') AS item
-          FROM raw_matches m,
-               jsonb_array_elements(m.raw->'info'->'participants') AS p,
-               jsonb_array_elements(p->'units')                    AS u
-          WHERE m.set_number = $1 AND m.patch = $2
-            AND u->>'character_id' = $3
-            AND jsonb_array_length(u->'itemNames') >= 3
-        )
-        SELECT t.item, ic.name,
-               AVG(t.placement)::float8 AS avg_place,
-               COUNT(*)::int8           AS picks,
-               ic.damage_type,
-               (SELECT AVG(placement)::float8 FROM item_rows) AS carry_mean
-        FROM item_rows t
-        JOIN item_classifications ic ON ic.item_id = t.item
-        GROUP BY t.item, ic.name, ic.damage_type
-        HAVING COUNT(*) >= $4
-        ORDER BY avg_place ASC
-        "#,
-    )
-    .bind(set_number).bind(patch).bind(character_id).bind(min_picks)
-    .fetch_all(pool).await?;
-
-    Ok(rows.into_iter()
-        .map(|(item, name, avg_placement, picks, damage_type, carry_mean)| ItemStat {
-            item, name, avg_placement, picks, damage_type, carry_mean,
-        })
-        .collect())
+    pub icon_url: String,
 }
 
 /// 캐리의 아이템별 통계 + lift (시그니처 정도).
@@ -494,7 +444,7 @@ pub async fn carry_item_full(
     character_id: &str,
     min_picks: i64,
 ) -> Result<Vec<ItemFull>> {
-    let rows: Vec<(String, String, f64, i64, String, f64, f64)> = sqlx::query_as(
+    let rows: Vec<(String, String, f64, i64, String, f64, f64, String)> = sqlx::query_as(
         r#"
         WITH carry_rows AS (
           SELECT (p->>'placement')::int                    AS placement,
@@ -524,12 +474,13 @@ pub async fn carry_item_full(
                COUNT(*)::int8           AS picks,
                ic.damage_type,
                (SELECT AVG(placement)::float8 FROM carry_rows) AS carry_mean,
-               ( (COUNT(*)::float8 / (SELECT n FROM carry_total)) /
-                 NULLIF(io.appears / (SELECT n FROM all_total), 0) ) AS lift
+               ((COUNT(*)::float8 / (SELECT n FROM carry_total)) /
+                NULLIF(io.appears / (SELECT n FROM all_total), 0)) AS lift,
+               COALESCE(ic.icon_url, '') AS icon_url
         FROM carry_rows t
         JOIN item_classifications ic ON ic.item_id = t.item
         JOIN item_overall io ON io.item = t.item
-        GROUP BY t.item, ic.name, ic.damage_type, io.appears
+        GROUP BY t.item, ic.name, ic.damage_type, io.appears, ic.icon_url
         HAVING COUNT(*) >= $4
         ORDER BY avg_place ASC
         "#,
@@ -537,11 +488,9 @@ pub async fn carry_item_full(
     .bind(set_number).bind(patch).bind(character_id).bind(min_picks)
     .fetch_all(pool).await?;
 
-    Ok(rows.into_iter()
-        .map(|(item, name, avg_placement, picks, damage_type, carry_mean, lift)| ItemFull {
-            item, name, avg_placement, picks, damage_type, carry_mean, lift,
-        })
-        .collect())
+    Ok(rows.into_iter().map(|(item, name, avg_placement, picks, damage_type, carry_mean, lift, icon_url)| ItemFull {
+        item, name, avg_placement, picks, damage_type, carry_mean, lift, icon_url,
+    }).collect())
 }
 
 // ───────────────────────── 아이템 분류 ─────────────────────────
@@ -779,14 +728,6 @@ pub async fn insert_item_puzzle(
     Ok(())
 }
 
-/// item_combine 퍼즐 전체 삭제 (재생성 전 호출).
-pub async fn clear_item_puzzles(pool: &PgPool) -> Result<()> {
-    sqlx::query("DELETE FROM puzzles WHERE puzzle_type = 'item_combine'")
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 /// 시도 기록 (정답 여부 포함).
 pub async fn record_attempt(
     pool: &PgPool,
@@ -862,4 +803,254 @@ pub async fn meta_info(pool: &PgPool) -> Result<MetaInfo> {
     .await?;
 
     Ok(MetaInfo { patch, total_matches: total, puzzle_count: pc })
+}
+
+pub async fn update_item_icon(pool: &PgPool, item_id: &str, icon_url: &str) -> Result<()> {
+    sqlx::query("UPDATE item_classifications SET icon_url = $2 WHERE item_id = $1")
+        .bind(item_id).bind(icon_url).execute(pool).await?;
+    Ok(())
+}
+
+/// 덱 하나의 원시 통계. 변형 흡수 전 단계.
+#[derive(Debug, Clone)]
+pub struct RawDeck {
+    pub units: Vec<String>,   // 고유 유닛 id 목록 (정렬됨)
+    pub games: i64,
+    pub avg_placement: f64,
+}
+
+/// 8기물 덱별 통계 (소환물/타세트 제외, 중복 유닛 합침).
+/// 변형 흡수는 이 결과를 받아 Rust에서 처리한다.
+pub async fn raw_decks(
+    pool: &PgPool,
+    patch: &str,
+    min_games: i64,
+) -> Result<Vec<RawDeck>> {
+    let rows: Vec<(String, i64, f64)> = sqlx::query_as(
+        r#"
+        SELECT deck, COUNT(*)::int8 AS games, ROUND(AVG(place), 2)::float8 AS avg_place
+        FROM (
+          SELECT (p->>'placement')::int AS place,
+                 (SELECT string_agg(DISTINCT u->>'character_id', ',' ORDER BY u->>'character_id')
+                  FROM jsonb_array_elements(p->'units') u
+                  WHERE u->>'character_id' LIKE 'TFT17_%'
+                    AND u->>'character_id' NOT LIKE '%Summon%'
+                    AND u->>'character_id' NOT LIKE '%Minion%') AS deck,
+                 (SELECT COUNT(DISTINCT u->>'character_id')
+                  FROM jsonb_array_elements(p->'units') u
+                  WHERE u->>'character_id' LIKE 'TFT17_%'
+                    AND u->>'character_id' NOT LIKE '%Summon%'
+                    AND u->>'character_id' NOT LIKE '%Minion%') AS unit_count
+          FROM raw_matches m,
+               jsonb_array_elements(m.raw->'info'->'participants') AS p
+          WHERE m.patch = $1
+        ) sub
+        WHERE unit_count = 8 AND deck IS NOT NULL
+        GROUP BY deck
+        HAVING COUNT(*) >= $2
+        ORDER BY avg_place ASC
+        "#,
+    )
+    .bind(patch)
+    .bind(min_games)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(deck, games, avg_placement)| RawDeck {
+            units: deck.split(',').map(|s| s.to_string()).collect(),
+            games,
+            avg_placement,
+        })
+        .collect())
+}
+
+/// 각 유닛의 전체 등장 보드 수 + 전체 보드 수. (정답 필터용)
+pub async fn unit_appearance_rates(
+    pool: &PgPool,
+    patch: &str,
+) -> Result<(std::collections::HashMap<String, i64>, i64)> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT u->>'character_id', COUNT(*)::int8
+        FROM raw_matches m,
+             jsonb_array_elements(m.raw->'info'->'participants') AS p,
+             jsonb_array_elements(p->'units') AS u
+        WHERE m.patch = $1 AND u->>'character_id' LIKE 'TFT17_%'
+        GROUP BY u->>'character_id'
+        "#,
+    )
+    .bind(patch)
+    .fetch_all(pool)
+    .await?;
+
+    let (total,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*)::int8 FROM raw_matches m,
+           jsonb_array_elements(m.raw->'info'->'participants') AS p WHERE m.patch = $1"#,
+    )
+    .bind(patch)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((rows.into_iter().collect(), total))
+}
+
+/// 덱(유닛 목록)에서 캐리를 찾는다.
+/// 캐리 = 이 덱 보드들에서 아이템을 가장 많이(평균) 든 유닛.
+pub async fn deck_carry(
+    pool: &PgPool,
+    patch: &str,
+    units: &[String],
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT u->>'character_id' AS unit
+        FROM raw_matches m,
+             jsonb_array_elements(m.raw->'info'->'participants') AS p,
+             jsonb_array_elements(p->'units') AS u
+        WHERE m.patch = $1
+          AND u->>'character_id' = ANY($2)
+        GROUP BY u->>'character_id'
+        ORDER BY SUM((
+          SELECT COUNT(*)
+          FROM jsonb_array_elements_text(u->'itemNames') AS it
+          JOIN item_classifications ic ON ic.item_id = it
+          WHERE ic.damage_type IN ('ad','ap','mixed')
+        )) DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(patch)
+    .bind(units)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(u,)| u))
+}
+
+/// 덱 완성 퍼즐 upsert. (덱키 + 뺀유닛)으로 정체성 유지 → 재생성해도 id 안정.
+pub async fn insert_deck_puzzle(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    deck_key: &str,      // carry_id 컬럼에 저장 (덱 정체성 = 정렬된 코어)
+    removed_unit: &str,  // variant 컬럼에 저장 (뺀 유닛)
+    prompt: &serde_json::Value,
+    options: &serde_json::Value,
+    answer: &str,
+    stats: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO puzzles
+            (puzzle_type, set_number, patch, carry_id, variant, carry_type,
+             prompt, options, answer, stats, source_match_id)
+        VALUES ('deck_complete', $1, $2, $3, $4, 'deck', $5, $6, $7, $8, NULL)
+        ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL
+        DO UPDATE SET
+            prompt     = EXCLUDED.prompt,
+            options    = EXCLUDED.options,
+            answer     = EXCLUDED.answer,
+            stats      = EXCLUDED.stats,
+            set_number = EXCLUDED.set_number
+        "#,
+    )
+    .bind(set_number).bind(patch).bind(deck_key).bind(removed_unit)
+    .bind(prompt).bind(options).bind(answer).bind(stats)
+    .execute(pool).await?;
+    Ok(())
+}
+
+pub async fn insert_flex_puzzle(
+    pool: &PgPool, set_number: i32, patch: &str, deck_key: &str,
+    prompt: &serde_json::Value, options: &serde_json::Value,
+    answer: &str, stats: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO puzzles
+            (puzzle_type, set_number, patch, carry_id, variant, carry_type,
+             prompt, options, answer, stats, source_match_id)
+        VALUES ('deck_flex', $1, $2, $3, 'flex', 'deck', $4, $5, $6, $7, NULL)
+        ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL
+        DO UPDATE SET prompt=EXCLUDED.prompt, options=EXCLUDED.options,
+            answer=EXCLUDED.answer, stats=EXCLUDED.stats, set_number=EXCLUDED.set_number
+        "#,
+    )
+    .bind(set_number).bind(patch).bind(deck_key)
+    .bind(prompt).bind(options).bind(answer).bind(stats)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// 안 푼 퍼즐 하나. puzzle_type 을 지정하면 그 유형만.
+pub async fn unsolved_puzzle_by_type(
+    pool: &PgPool,
+    user_id: &str,
+    puzzle_type: &str,
+) -> Result<Option<PuzzleRow>> {
+    let row: Option<PuzzleRow> = sqlx::query_as(
+        r#"
+        SELECT id, puzzle_type, patch, set_number, prompt, options, stats
+        FROM puzzles p
+        WHERE p.puzzle_type = $2
+          AND NOT EXISTS (
+            SELECT 1 FROM puzzle_attempts a
+            WHERE a.user_id = $1 AND a.puzzle_id = p.id
+          )
+        ORDER BY random()
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(puzzle_type)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// 덱(코어 유닛들이 모두 포함된 보드)의 대표 특성 apiName.
+/// num_units>=2 이고 style(활성등급) 최고인 특성을 보드마다 뽑아 최빈값.
+pub async fn deck_signature_trait(
+    pool: &PgPool,
+    patch: &str,
+    core_units: &[String],
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        WITH core_boards AS (
+          SELECT p
+          FROM raw_matches m,
+               jsonb_array_elements(m.raw->'info'->'participants') AS p
+          WHERE m.patch = $1
+            AND (
+              SELECT bool_and(cu = ANY(
+                ARRAY(SELECT u->>'character_id' FROM jsonb_array_elements(p->'units') u)
+              ))
+              FROM unnest($2::text[]) AS cu
+            )
+        ),
+        -- 각 보드의 "대표 특성" (num_units>=2 중 style 최고 1개)
+        board_top_trait AS (
+          SELECT (
+            SELECT t->>'name'
+            FROM jsonb_array_elements(cb.p->'traits') t
+            WHERE (t->>'num_units')::int >= 2
+            ORDER BY (t->>'style')::int DESC, (t->>'num_units')::int DESC
+            LIMIT 1
+          ) AS trait_name
+          FROM core_boards cb
+        )
+        SELECT trait_name FROM board_top_trait
+        WHERE trait_name IS NOT NULL
+        GROUP BY trait_name
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(patch)
+    .bind(core_units)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(t,)| t))
 }

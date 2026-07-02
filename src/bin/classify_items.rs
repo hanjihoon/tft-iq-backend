@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // ── 분류 ────────────────────────────────────────────────
     // (item_id, name, category, is_damage, damage_type)
     let mut classified: HashMap<String, (String, String, bool, String)> = HashMap::new();
+    let mut icons: HashMap<String, String> = HashMap::new();
 
     for it in items {
         let (Some(api), Some(name)) = (
@@ -91,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
         ) else {
             continue;
         };
+        let icon_url = it.get("icon").and_then(|x| x.as_str())
+            .map(|ic| format!(
+                "https://raw.communitydragon.org/latest/game/{}",
+                ic.to_lowercase().replace(".tex", ".png")
+            ))
+            .unwrap_or_default();
         let Some(comp) = it.get("composition").and_then(|x| x.as_array()) else {
             continue;
         };
@@ -151,13 +158,11 @@ async fn main() -> anyhow::Result<()> {
 
         classified.insert(
             api.to_string(),
-            (
-                name.to_string(),
-                category.to_string(),
-                is_damage,
-                damage_type.to_string(),
-            ),
+            (name.to_string(), category.to_string(), is_damage, damage_type.to_string()),
         );
+        if !icon_url.is_empty() {
+            icons.insert(api.to_string(), icon_url.clone());
+        }
     }
 
     eprintln!("완성 아이템 {}종 분류됨", classified.len());
@@ -166,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     for (item_id, (name, category, is_damage, damage_type)) in &classified {
         db::upsert_item_classification(&pool, item_id, name, category, *is_damage, damage_type)
             .await?;
+        if let Some(url) = icons.get(item_id) {
+            db::update_item_icon(&pool, item_id, url).await?;
+        }
     }
     eprintln!("저장 완료\n");
 

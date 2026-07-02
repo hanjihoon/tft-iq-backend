@@ -87,6 +87,8 @@ pub struct NamedRef {
 pub struct OptionItem {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
 }
 
 // ───────────────────────── stats (feedback) ─────────────────────────

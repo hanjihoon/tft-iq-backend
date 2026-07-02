@@ -31,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
         run_step("crawler").await;
         // 2) 퍼즐 재생성
         run_step("item_quiz_gen").await;
+        run_step("deck_quiz_gen").await;
+
+
 
         eprintln!("=== 사이클 완료, {interval_secs}초 대기 ===");
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;

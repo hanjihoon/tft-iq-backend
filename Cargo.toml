@@ -13,10 +13,6 @@ name = "crawler"
 path = "src/bin/crawler.rs"
 
 [[bin]]
-name = "generator"
-path = "src/bin/generator.rs"
-
-[[bin]]
 name = "server"
 path = "src/bin/server.rs"
 

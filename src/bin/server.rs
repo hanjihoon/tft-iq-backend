@@ -216,10 +216,11 @@ async fn answer_quiz(
     let correct = req.chosen == answer;
 
     let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    // puuid는 있으면 유저 정보 보강(선택), 시도 기록은 항상 저장
     if let Some(puuid) = req.user_puuid.as_deref() {
         db::ensure_user(&st.pool, puuid, None).await?;
-        db::record_attempt(&st.pool, user_id, id, &req.chosen, correct).await?;
     }
+    db::record_attempt(&st.pool, user_id, id, &req.chosen, correct).await?;
 
     Ok(Json(AttemptResp { correct, answer, stats }))
 }

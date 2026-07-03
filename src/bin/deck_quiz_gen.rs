@@ -18,18 +18,11 @@
 use std::collections::HashSet;
  
 use rand::seq::SliceRandom;
-use tft_iq::{
-    db,
-    deck_cluster::{cluster_decks, filter_tier_decks, DeckCluster},
-    meta::Meta,
-    Config,
-};
+use tft_iq::{db, meta::Meta, Config};
  
-const RAW_MIN_GAMES: i64 = 40; // 원시 덱 최소 표본
-const MIN_COMMON: usize = 7; // 변형 흡수 기준 (공통 7개+ = 1기물 차이)
-const SOFT_GAMES: i64 = 100; // 순방덱(avg 4.5~5.0) 최소 표본
+const RAW_MIN_GAMES: i64 = 70; // 원시 덱 최소 표본
 const N_OPTIONS: usize = 4; // 보기 개수 (정답 1 + 오답 3)
-const MIN_CORE: usize = 6; // 코어가 이보다 적으면 덱 스킵 (정체성 불명확)
+// const MIN_CORE: usize = 6; // 코어가 이보다 적으면 덱 스킵 (정체성 불명확)
 const MAX_APPEAR_RATE: f64 = 0.30; // 등장률 30% 초과 = 순수 접착제 → 정답 제외
  
 #[tokio::main]
@@ -51,9 +44,18 @@ async fn main() -> anyhow::Result<()> {
     let meta = Meta::load(set_number).await?;
 
     // 1~3단계: 원시 덱 → 흡수 → 티어덱
+    // 임시: 표본별 덱 수 확인
+    for threshold in [50i64, 100, 150, 200] {
+        let d = db::raw_decks(&pool, &patch, threshold).await?;
+        let valid = d.iter().filter(|x| x.avg_placement <= 5.0).count();
+        eprintln!("{}판 이상 + avg5이하: {} 덱 (전체 {})", threshold, valid, d.len());
+    }
+
     let raw = db::raw_decks(&pool, &patch, RAW_MIN_GAMES).await?;
-    let clusters = cluster_decks(raw, MIN_COMMON);
-    let tier_decks = filter_tier_decks(clusters, SOFT_GAMES);
+    let tier_decks: Vec<db::RawDeck> = raw
+        .into_iter()
+        .filter(|d| d.avg_placement <= 5.0)
+        .collect();
     eprintln!("티어덱 {}개", tier_decks.len());
  
     // 유닛별 전체 등장률 (정답 필터용) — 너무 흔한 유닛은 정답에서 제외
@@ -62,9 +64,12 @@ async fn main() -> anyhow::Result<()> {
     // 전체 티어덱에 등장하는 모든 유닛 = "메타 유닛 풀" (오답 후보)
     let meta_pool: Vec<String> = {
         let mut set: HashSet<String> = HashSet::new();
-        for c in &tier_decks {
-            for v in &c.variants {
-                for u in &v.units {
+        for d in &tier_decks {
+            for u in &d.units {
+                if u.starts_with("TFT17_")
+                    && !u.contains("Summon")
+                    && !u.contains("Minion")
+                {
                     set.insert(u.clone());
                 }
             }
@@ -76,27 +81,13 @@ async fn main() -> anyhow::Result<()> {
     let mut rng = rand::thread_rng();
     let mut made = 0;
  
-    for cluster in &tier_decks {
-        if cluster.core.len() < MIN_CORE {
-            continue; // 코어가 너무 적으면 덱 정체성이 약함 → 스킵
-        }
+    for deck in &tier_decks {
+        // 이 덱의 유닛 = 정확히 이 8명 (흡수 없음)
+        let deck_units: HashSet<&String> = deck.units.iter().collect();
  
-        // 이 덱의 전체 유닛(코어 + 모든 변형 플렉스) = 오답에서 제외할 집합
-        let deck_units: HashSet<&String> = cluster
-            .variants
-            .iter()
-            .flat_map(|v| v.units.iter())
-            .collect();
- 
-        // 덱 이름 (임시): 코어 중 대표 유닛 한글명. 특성 기반은 2단계에서.
-        let deck_label = match db::deck_signature_trait(&pool, &patch, &cluster.core).await? {
-            Some(trait_id) => meta.trait_name(&trait_id),
-            None => deck_display_name(cluster, &meta), // 특성 없으면 대표 유닛명 폴백
-        };
- 
-        // 너무 흔한 유닛(등장 30%+)은 정답에서 제외 → 카르마·모데 도배 방지
-        let signature_core: Vec<String> = cluster
-            .core
+        // 너무 흔한 유닛은 정답에서 제외 (범용 유닛 도배 방지)
+        let signature_core: Vec<String> = deck
+            .units
             .iter()
             .filter(|u| {
                 let rate = *unit_appears.get(*u).unwrap_or(&0) as f64 / total_boards as f64;
@@ -105,11 +96,16 @@ async fn main() -> anyhow::Result<()> {
             .cloned()
             .collect();
 
+        // 이름은 특성만
+        let deck_label = match db::deck_signature_trait(&pool, &patch, &deck.units).await? {
+            Some(trait_id) => meta.trait_name(&trait_id),
+            None => deck.units.first().map(|u| meta.unit_name(u)).unwrap_or_default(),
+        };
+
         // 코어 유닛을 하나씩 빼서 문제 생성 (시그니처 코어만 정답)
         for removed in &signature_core {
-            // 화면에 보여줄 유닛 = 코어에서 정답만 뺀 것
-            let shown: Vec<String> = cluster
-                .core
+            let shown: Vec<String> = deck
+                .units
                 .iter()
                 .filter(|u| *u != removed)
                 .cloned()
@@ -170,8 +166,8 @@ async fn main() -> anyhow::Result<()> {
             });
  
             let stats = serde_json::json!({
-                "deck_avg": cluster.best_avg,
-                "deck_games": cluster.total_games,
+                "deck_avg": deck.avg_placement,
+                "deck_games": deck.games,
                 "answer": { "id": removed, "name": meta.unit_name(removed), "icon": unit_icon(removed) },
                 "options": option_ids.iter().map(|id| serde_json::json!({
                     "id": id, "name": meta.unit_name(id), "is_best": id == removed,
@@ -179,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             });
  
             // 덱 정체성 키 = 정렬된 코어 (변형 흡수됐으니 안정적)
-            let deck_key = cluster.core.join(",");
+            let deck_key = deck.units.join(",");
  
             db::insert_deck_puzzle(
                 &pool,
@@ -195,79 +191,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             made += 1;
         }
-
-        // ── 층위 2: 마무리 최적화 (변형 2개 이상만) ──
-        if cluster.variants.len() >= 2 {
-            // 각 변형의 플렉스 유닛(코어 아닌 것) + 평균등수
-            // variants[i].units 에서 코어를 뺀 것이 그 변형의 플렉스
-            let core_set: HashSet<&String> = cluster.core.iter().collect();
-            let mut flex_opts: Vec<(String, f64, i64)> = Vec::new(); // (unit, avg, games)
-            for v in &cluster.variants {
-                for u in &v.units {
-                    if !core_set.contains(u) {
-                        flex_opts.push((u.clone(), v.avg_placement, v.games));
-                    }
-                }
-            }
-            // 플렉스 후보가 2개 미만이면 문제 불가
-            if flex_opts.len() >= 2 {
-                // 최적 = 평균등수 최저
-                flex_opts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                let answer_flex = flex_opts[0].0.clone();
-
-                // 보기 = 플렉스 후보들 (최대 4개), 각 평균등수 포함
-                let options: Vec<serde_json::Value> = flex_opts.iter().take(N_OPTIONS)
-                    .map(|(id, avg, games)| serde_json::json!({
-                        "id": id, "name": meta.unit_name(id), "icon": unit_icon(id),
-                        "avg_placement": (avg * 100.0).round() / 100.0, "games": games,
-                    })).collect();
-
-                let shown_units: Vec<serde_json::Value> = cluster.core.iter()
-                    .map(|id| serde_json::json!({
-                        "id": id, "name": meta.unit_name(id), "icon": unit_icon(id),
-                    })).collect();
-
-                let prompt = serde_json::json!({
-                    "question": format!("{} 덱의 마지막 한 자리, 최적은?", deck_label),
-                    "deck_label": deck_label,
-                    "shown_units": shown_units,
-                    "patch": patch,
-                });
-                let stats = serde_json::json!({
-                    "deck_avg": cluster.best_avg,
-                    "deck_games": cluster.total_games,
-                    "answer": { "id": answer_flex, "name": meta.unit_name(&answer_flex) },
-                    "options": flex_opts.iter().take(N_OPTIONS).map(|(id, avg, games)| serde_json::json!({
-                        "id": id, "name": meta.unit_name(id),
-                        "avg_placement": (avg * 100.0).round() / 100.0, "games": games,
-                        "is_best": *id == answer_flex,
-                    })).collect::<Vec<_>>(),
-                });
-
-                let deck_key = cluster.core.join(",");
-                db::insert_flex_puzzle(
-                    &pool, set_number, &patch, &deck_key,
-                    &prompt, &serde_json::Value::Array(options), &answer_flex, &stats,
-                ).await?;
-                made += 1;
-            }
-        }
     }
  
     eprintln!("덱 완성 퀴즈 {made}개 생성");
     Ok(())
-}
- 
-/// 덱 표시 이름 (임시): 코어 중 가장 고코스트 유닛의 한글명 + " 덱".
-/// 캐리 판별은 예외가 많아 접었고, 특성 기반 이름은 2단계 작업.
-fn deck_display_name(cluster: &DeckCluster, meta: &Meta) -> String {
-    let top = cluster
-        .core
-        .iter()
-        .max_by_key(|u| meta.unit_cost(u, 0))
-        .map(|u| meta.unit_name(u))
-        .unwrap_or_else(|| "티어".to_string());
-    format!("{top}")
 }
  
 /// 유닛 아이콘 URL (Community Dragon). id 예: "TFT17_Karma".

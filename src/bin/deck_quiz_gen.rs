@@ -15,7 +15,7 @@
 //!
 //! 실행:  cargo run --bin deck_quiz_gen
  
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
  
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let (set_number, patch) = (info.set_number, info.patch.clone());
     eprintln!("대상: set {set_number}, patch {patch}");
  
-    let meta = Meta::load(set_number).await?;
+    let meta = Meta::load(set_number, false).await?;
 
     // 1~3단계: 원시 덱 → 흡수 → 티어덱
     // 임시: 표본별 덱 수 확인
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|u| *u != removed)
                 .cloned()
                 .collect();
- 
+
             // 오답 후보: 메타 풀 - 이 덱 유닛
             let mut distractor_pool: Vec<String> = meta_pool
                 .iter()
@@ -157,11 +157,31 @@ async fn main() -> anyhow::Result<()> {
                     })
                 })
                 .collect();
+
+            let mut synergy: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+            for uid in &shown {
+                if let Some(u) = meta.units.get(uid) {
+                    for tr in &u.traits {
+                        *synergy.entry(tr.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            // 2개 이상 모인 특성만, 많은 순 정렬
+            let mut synergies: Vec<(String, i32)> = synergy
+                .into_iter()
+                .filter(|(_, n)| *n >= 2)
+                .collect();
+            synergies.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let synergies_json: Vec<serde_json::Value> = synergies
+                .iter()
+                .map(|(tr, n)| serde_json::json!({ "trait": tr, "count": n }))
+                .collect();
  
             let prompt = serde_json::json!({
                 "question": format!("{} 덱에서 빠진 핵심 유닛은?", deck_label),
                 "deck_label": deck_label,
                 "shown_units": shown_units,
+                "synergies": synergies_json,
                 "patch": patch,
             });
  
@@ -199,14 +219,18 @@ async fn main() -> anyhow::Result<()> {
  
 /// 유닛 아이콘 URL (Community Dragon). id 예: "TFT17_Karma".
 fn unit_icon(id: &str) -> String {
-    let low = id.to_lowercase(); // tft17_karma
-    // 접두사 tft{N}_ 에서 N 추출
+    let low = id.to_lowercase();
     let set = low
         .trim_start_matches("tft")
         .split('_')
         .next()
         .unwrap_or("");
+    // 파일명이 유닛 id와 다른 특수 유닛 (변신폼 등). 폴더는 id, 파일명만 예외.
+    let file_base: &str = match low.as_str() {
+        "tft17_rhaast" => "tft17_kayn_slay", // 라스트=케인 변신폼
+        other => other,
+    };
     format!(
-        "https://raw.communitydragon.org/latest/game/assets/characters/{low}/hud/{low}_square.tft_set{set}.png"
+        "https://raw.communitydragon.org/latest/game/assets/characters/{low}/hud/{file_base}_square.tft_set{set}.png"
     )
 }

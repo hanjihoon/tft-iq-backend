@@ -12,6 +12,7 @@ const CDRAGON_KO: &str = "https://raw.communitydragon.org/latest/cdragon/tft/ko_
 pub struct UnitMeta {
     pub name: String,
     pub cost: i32,
+    pub traits: Vec<String>,
 }
 
 pub struct Meta {
@@ -23,9 +24,15 @@ pub struct Meta {
 
 impl Meta {
     /// 특정 세트의 메타데이터를 로드.
-    pub async fn load(set_number: i32) -> Result<Self> {
+    pub async fn load(set_number: i32, use_pbe: bool) -> Result<Self> {
         // 메타 로드는 1회성이라 기본 클라이언트로 충분
-        let v: serde_json::Value = reqwest::get(CDRAGON_KO).await?.json().await?;
+        let url = if use_pbe {
+            "https://raw.communitydragon.org/pbe/cdragon/tft/ko_kr.json"
+        } else {
+            "https://raw.communitydragon.org/latest/cdragon/tft/ko_kr.json"
+        };
+
+        let v: serde_json::Value = reqwest::get(url).await?.json().await?;
 
         let mut augments = HashMap::new();
         let mut items = HashMap::new();
@@ -82,17 +89,30 @@ impl Meta {
                             continue;
                         };
                         let cost = c.get("cost").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+                        // 유닛의 특성 배열 (예: ["우주 그루브", "저격수"])
+                        let traits: Vec<String> = c
+                            .get("traits")
+                            .and_then(|t| t.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
                         units.insert(
                             id.to_string(),
                             UnitMeta {
                                 name: name.to_string(),
                                 cost,
+                                traits,
                             },
                         );
                     }
                 }
             }
         }
+
 
         Ok(Self {
             augments,

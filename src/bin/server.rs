@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/quiz/{id}/answer", post(answer_quiz))
         .route("/api/quiz/next", get(next_unsolved))
         .route("/api/meta/info", get(meta_info_handler))
+        .route("/api/quiz/review/count", get(review_counts))
+        .route("/api/quiz/stats", get(user_stats_handler))
+        .route("/api/quiz/reset", post(reset_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -234,7 +237,24 @@ async fn next_unsolved(
     let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
     // ?type=item_combine | deck_complete, 기본은 item_combine
     let ptype = q.get("type").map(|s| s.as_str()).unwrap_or("item_combine");
-    match db::unsolved_puzzle_by_type(&st.pool, user_id, ptype).await? {
+    let mode = q.get("mode").map(|s| s.as_str()).unwrap_or("normal");
+
+
+    let current_patch = match db::current_patch_info(&st.pool).await? {
+        Some(info) => info.patch,
+        None => {
+            // 표본 충분한 패치 없음 → 서빙할 게 없음
+            return Ok(Json(serde_json::json!({ "all_solved": true })));
+        }
+    };
+
+    let puzzle = if mode == "review" {
+        db::review_puzzle(&st.pool, user_id, ptype, &current_patch).await?
+    } else {
+        db::unsolved_puzzle_by_type(&st.pool, user_id, ptype, &current_patch).await?
+    };
+    
+    match puzzle {
         Some(p) => Ok(Json(serde_json::json!({
             "status": "ok",
             "puzzle": {
@@ -262,4 +282,30 @@ async fn meta_info_handler(State(st): State<AppState>) -> Result<Json<serde_json
         "approx_rank": approx_rank,
         "region": "한국 서버",
     })))
+}
+
+// server.rs에 새 라우트 핸들러
+async fn review_counts(
+    State(st): State<AppState>, headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    let item = db::review_count(&st.pool, user_id, "item_combine").await?;
+    let deck = db::review_count(&st.pool, user_id, "deck_complete").await?;
+    Ok(Json(serde_json::json!({ "item_combine": item, "deck_complete": deck })))
+}
+// 라우트 등록: .route("/api/quiz/review/count", get(review_counts))
+
+async fn user_stats_handler(
+    State(st): State<AppState>, headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    Ok(Json(db::user_stats(&st.pool, user_id).await?))
+}
+
+async fn reset_handler(
+    State(st): State<AppState>, headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    let deleted = db::reset_attempts(&st.pool, user_id).await?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
 }

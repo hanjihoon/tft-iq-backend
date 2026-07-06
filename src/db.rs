@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
+
+const MIN_PATCH_MATCHES: i64 = 2000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
+
 pub async fn connect(database_url: &str) -> Result<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -369,10 +372,12 @@ pub async fn current_patch_info(pool: &PgPool) -> Result<Option<PatchInfo>> {
                (EXTRACT(EPOCH FROM (now() - earliest_game_datetime)) / 86400.0)::float8,
                match_count
         FROM patch_versions
+        WHERE match_count >= $1
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
     )
+    .bind(MIN_PATCH_MATCHES)
     .fetch_optional(pool)
     .await?;
 
@@ -558,10 +563,12 @@ pub async fn current_patch_match_count(pool: &PgPool) -> Result<i64> {
         r#"
         SELECT match_count::int8
         FROM patch_versions
+        WHERE match_count >= $1
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
     )
+    .bind(MIN_PATCH_MATCHES)
     .fetch_optional(pool)
     .await?;
     // 패치 데이터가 아직 없으면 0
@@ -576,10 +583,12 @@ pub async fn current_patch_start_time(pool: &PgPool) -> Result<Option<i64>> {
         r#"
         SELECT (EXTRACT(EPOCH FROM earliest_game_datetime)::int8 - 12 * 3600)
         FROM patch_versions
+        WHERE match_count >= $1
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
     )
+    .bind(MIN_PATCH_MATCHES)
     .fetch_optional(pool)
     .await?;
 
@@ -988,12 +997,14 @@ pub async fn unsolved_puzzle_by_type(
     pool: &PgPool,
     user_id: &str,
     puzzle_type: &str,
+    patch: &str,
 ) -> Result<Option<PuzzleRow>> {
     let row: Option<PuzzleRow> = sqlx::query_as(
         r#"
         SELECT id, puzzle_type, patch, set_number, prompt, options, stats
         FROM puzzles p
         WHERE p.puzzle_type = $2
+          AND ($2 = 'trait_quiz' OR p.patch = $3)     
           AND NOT EXISTS (
             SELECT 1 FROM puzzle_attempts a
             WHERE a.user_id = $1 AND a.puzzle_id = p.id
@@ -1004,6 +1015,7 @@ pub async fn unsolved_puzzle_by_type(
     )
     .bind(user_id)
     .bind(puzzle_type)
+    .bind(patch)
     .fetch_optional(pool)
     .await?;
     Ok(row)
@@ -1053,4 +1065,219 @@ pub async fn deck_signature_trait(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(t,)| t))
+}
+
+
+/// 복습 대상: 이 유저가 마지막으로 틀린 문제 (그 뒤 안 맞힘).
+/// 같은 문제를 여러 번 풀었으면 가장 최근 시도 기준.
+pub async fn review_puzzle(
+    pool: &PgPool,
+    user_id: &str,
+    puzzle_type: &str,
+    patch: &str,
+) -> Result<Option<PuzzleRow>> {
+    let row: Option<PuzzleRow> = sqlx::query_as(
+        r#"
+        SELECT p.id, p.puzzle_type, p.patch, p.set_number, p.prompt, p.options, p.stats
+        FROM puzzles p
+        WHERE p.puzzle_type = $2
+        AND p.patch = $3 
+          AND EXISTS (
+            -- 이 퍼즐의 가장 최근 시도가 '틀림'인 경우
+            SELECT 1 FROM puzzle_attempts a
+            WHERE a.user_id = $1 AND a.puzzle_id = p.id
+              AND a.correct = false
+              AND a.created_at = (
+                SELECT MAX(a2.created_at) FROM puzzle_attempts a2
+                WHERE a2.user_id = $1 AND a2.puzzle_id = p.id
+              )
+          )
+        ORDER BY random()
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(puzzle_type)
+    .bind(patch)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// 복습 대상 개수
+pub async fn review_count(pool: &PgPool, user_id: &str, puzzle_type: &str) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::int8 FROM puzzles p
+        WHERE p.puzzle_type = $2
+          AND EXISTS (
+            SELECT 1 FROM puzzle_attempts a
+            WHERE a.user_id = $1 AND a.puzzle_id = p.id AND a.correct = false
+              AND a.created_at = (
+                SELECT MAX(a2.created_at) FROM puzzle_attempts a2
+                WHERE a2.user_id = $1 AND a2.puzzle_id = p.id
+              )
+          )
+        "#,
+    ).bind(user_id).bind(puzzle_type).fetch_one(pool).await?;
+    Ok(n)
+}
+
+/// 유저의 학습 통계: 전체/유형별 정답률 + 약점(자주 틀리는 그룹).
+pub async fn user_stats(pool: &PgPool, user_id: &str) -> Result<serde_json::Value> {
+    // 1) 유형별 정답률 + 총계
+    let type_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT p.puzzle_type,
+               COUNT(*)::int8 AS total,
+               COUNT(*) FILTER (WHERE a.correct)::int8 AS correct
+        FROM puzzle_attempts a
+        JOIN puzzles p ON p.id = a.puzzle_id
+        WHERE a.user_id = $1
+        GROUP BY p.puzzle_type
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    // 2) 약점: 그룹(덱=deck_label, 아이템=carry명)별 정답률 낮은 순 TOP 5
+    //    최소 2회 이상 시도한 그룹만 (표본)
+    let weak_rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT p.puzzle_type,
+               COALESCE(
+                 p.prompt->>'deck_label',
+                 p.prompt->'carry'->>'name'
+               ) AS grp,
+               COUNT(*)::int8 AS total,
+               COUNT(*) FILTER (WHERE a.correct)::int8 AS correct
+        FROM puzzle_attempts a
+        JOIN puzzles p ON p.id = a.puzzle_id
+        WHERE a.user_id = $1
+        GROUP BY p.puzzle_type, grp
+        HAVING COUNT(*) >= 2
+           AND (COUNT(*) FILTER (WHERE a.correct))::float8 / COUNT(*) < 0.7
+        ORDER BY (COUNT(*) FILTER (WHERE a.correct))::float8 / COUNT(*) ASC
+        LIMIT 5
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let by_type: Vec<serde_json::Value> = type_rows.iter().map(|(t, total, correct)| {
+        serde_json::json!({
+            "type": t, "total": total, "correct": correct,
+            "rate": if *total > 0 { (*correct as f64 / *total as f64 * 100.0).round() } else { 0.0 },
+        })
+    }).collect();
+
+    let total: i64 = type_rows.iter().map(|(_, t, _)| t).sum();
+    let correct: i64 = type_rows.iter().map(|(_, _, c)| c).sum();
+
+    let weak: Vec<serde_json::Value> = weak_rows.iter().map(|(t, grp, total, correct)| {
+        serde_json::json!({
+            "type": t, "group": grp, "total": total, "correct": correct,
+            "rate": (*correct as f64 / *total as f64 * 100.0).round(),
+        })
+    }).collect();
+
+    Ok(serde_json::json!({
+        "total": total,
+        "correct": correct,
+        "rate": if total > 0 { (correct as f64 / total as f64 * 100.0).round() } else { 0.0 },
+        "by_type": by_type,
+        "weak": weak,
+    }))
+}
+
+pub async fn reset_attempts(pool: &PgPool, user_id: &str) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM puzzle_attempts WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// 매치 수 상한 유지: 초과분을 [이전 패치 → 오래된 순]으로 삭제.
+/// 티어 컬럼이 없지만, 수집 정책상 오래된 매치가 곧 저티어라
+/// 시간순 삭제가 사실상 저티어 우선 삭제로 동작한다.
+pub async fn prune_matches(pool: &PgPool, keep: i64, current_patch: &str) -> Result<u64> {
+    let r = sqlx::query(
+        r#"
+        DELETE FROM raw_matches
+        WHERE match_id IN (
+            SELECT match_id FROM raw_matches
+            ORDER BY (patch = $1) ASC,   -- 현재 패치는 뒤로(보존), 이전 패치 먼저 삭제
+                     game_datetime ASC    -- 오래된 것 먼저 삭제
+            OFFSET $2                      -- 상위 keep개 보존, 나머지 삭제
+        )
+        "#,
+    )
+    .bind(current_patch)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// 현재 패치를 특정 못 할 때: 순수 시간순으로만 정리
+pub async fn prune_matches_by_time(pool: &PgPool, keep: i64) -> Result<u64> {
+    let r = sqlx::query(
+        r#"
+        DELETE FROM raw_matches
+        WHERE match_id IN (
+            SELECT match_id FROM raw_matches
+            ORDER BY game_datetime ASC
+            OFFSET $1
+        )
+        "#,
+    )
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// 전체 매치 수
+pub async fn total_match_count(pool: &PgPool) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*)::int8 FROM raw_matches")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+
+pub async fn insert_trait_puzzle(
+    pool: &PgPool,
+    puzzle_type: &str,
+    patch: &str,
+    set_number: i32,
+    unit_id: &str,
+    answer: &str,              // 추가: "우주 그루브,저격수"
+    prompt: &serde_json::Value,
+    stats: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO puzzles (puzzle_type, patch, set_number, carry_id, variant, answer, prompt, options, stats)
+        VALUES ($1, $2, $3, $4, '0', $5, $6, '[]'::jsonb, $7)
+        ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL
+        DO UPDATE SET
+            answer = EXCLUDED.answer,
+            prompt = EXCLUDED.prompt,
+            stats = EXCLUDED.stats
+        "#,
+    )
+    .bind(puzzle_type)
+    .bind(patch)
+    .bind(set_number)
+    .bind(unit_id)
+    .bind(answer)          // $5
+    .bind(prompt)          // $6
+    .bind(stats)           // $7
+    .execute(pool)
+    .await?;
+    Ok(())
 }

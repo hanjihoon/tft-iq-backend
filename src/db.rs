@@ -961,7 +961,8 @@ pub async fn insert_deck_puzzle(
             options    = EXCLUDED.options,
             answer     = EXCLUDED.answer,
             stats      = EXCLUDED.stats,
-            set_number = EXCLUDED.set_number
+            set_number = EXCLUDED.set_number,
+            updated_at = now()
         "#,
     )
     .bind(set_number).bind(patch).bind(deck_key).bind(removed_unit)
@@ -1267,7 +1268,8 @@ pub async fn insert_trait_puzzle(
         DO UPDATE SET
             answer = EXCLUDED.answer,
             prompt = EXCLUDED.prompt,
-            stats = EXCLUDED.stats
+            stats = EXCLUDED.stats,
+            updated_at = now()
         "#,
     )
     .bind(puzzle_type)
@@ -1280,4 +1282,134 @@ pub async fn insert_trait_puzzle(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// db.rs
+pub async fn insert_report(
+    pool: &PgPool, puzzle_id: Uuid, user_id: &str, reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO puzzle_reports (puzzle_id, user_id, reason) VALUES ($1, $2, $3)"
+    )
+    .bind(puzzle_id).bind(user_id).bind(reason)
+    .execute(pool).await?;
+    Ok(())
+}
+
+// 관리용: 제보 많은 문제 조회
+pub async fn top_reported(pool: &PgPool) -> Result<Vec<(Uuid, i64)>> {
+    let rows = sqlx::query_as(
+        "SELECT puzzle_id, COUNT(*)::int8 FROM puzzle_reports
+         GROUP BY puzzle_id ORDER BY COUNT(*) DESC LIMIT 30"
+    ).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+pub async fn upsert_deck_stats(
+    pool: &PgPool, deck_key: &str, patch: &str, set_number: i32,
+    units: &serde_json::Value, trait_label: &str, avg: f64, games: i64,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO deck_stats (deck_key, patch, set_number, units, trait_label, avg_placement, games, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        ON CONFLICT (deck_key, patch) DO UPDATE SET
+            units = EXCLUDED.units,
+            trait_label = EXCLUDED.trait_label,
+            avg_placement = EXCLUDED.avg_placement,
+            games = EXCLUDED.games,
+            updated_at = now()
+        "#,
+    )
+    .bind(deck_key).bind(patch).bind(set_number)
+    .bind(units).bind(trait_label).bind(avg).bind(games)
+    .execute(pool).await?;
+    Ok(())
+}
+
+pub async fn meta_decks(pool: &PgPool, patch: &str) -> Result<Vec<serde_json::Value>> {
+    let rows: Vec<(serde_json::Value, Option<String>, f32, i32)> = sqlx::query_as(
+        r#"
+        SELECT units, trait_label, avg_placement, games
+        FROM deck_stats
+        WHERE patch = $1
+        ORDER BY avg_placement ASC
+        LIMIT 50
+        "#,
+    )
+    .bind(patch)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(units, trait_label, avg, games)| {
+            serde_json::json!({
+                "units": units,
+                "trait_label": trait_label,
+                "avg_placement": avg,
+                "games": games,
+            })
+        })
+        .collect())
+}
+
+use std::collections::HashMap;
+
+#[derive(Clone, serde::Serialize)]
+pub struct CarryItem {
+    pub name: String,
+    pub icon: String,
+    pub avg: f64,
+}
+
+/// 모든 캐리의 추천 아이템 top3를 한 번에 로드 → carry_id로 조회 가능한 맵
+pub async fn load_carry_top_items(pool: &PgPool) -> Result<HashMap<String, Vec<CarryItem>>> {
+    let rows: Vec<(String, String, Option<String>, f64)> = sqlx::query_as(
+        r#"
+        SELECT carry_id, t2.name, ic.icon_url AS icon, avg
+        FROM (
+            SELECT 
+                carry_id, name, avg,
+                -- [2단계] 피바/정손 승자와 나머지 아이템 전체를 두고 진짜 상위 3개를 뽑습니다.
+                ROW_NUMBER() OVER (
+                    PARTITION BY carry_id 
+                    ORDER BY avg ASC
+                ) AS final_rn
+            FROM (
+                SELECT
+                    p.prompt->'carry'->>'id' AS carry_id,
+                    s->>'name' AS name,
+                    MIN((s->>'avg_placement')::float8) AS avg,
+                    -- [1단계] 피바라기와 정의의 손길끼리만 내부 순위를 매깁니다.
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.prompt->'carry'->>'id',
+                                    CASE WHEN s->>'name' IN ('피바라기', '정의의 손길', '마법공학 총검') THEN '피바_정손_총검_그룹' ELSE s->>'name' END
+                        ORDER BY MIN((s->>'avg_placement')::float8) ASC
+                    ) AS inner_rn
+                FROM puzzles p, jsonb_array_elements(p.stats->'options') s
+                WHERE p.puzzle_type='item_combine' AND s->>'avg_placement' IS NOT NULL
+                GROUP BY p.prompt->'carry'->>'id', s->>'name'
+            ) t1
+            -- 피바라기와 정의의 손길 중 패자(inner_rn = 2)를 여기서 완벽히 탈락시킵니다.
+            -- 일반 아이템들은 그룹명이 다 달라 각각 inner_rn이 무조건 1이므로 무사히 통과합니다.
+            WHERE inner_rn = 1
+        ) t2
+        INNER JOIN item_classifications ic ON ic.name = t2.name
+        WHERE final_rn <= 3
+        ORDER BY carry_id, avg;
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut map: HashMap<String, Vec<CarryItem>> = HashMap::new();
+    for (carry_id, name, icon, avg) in rows {
+        map.entry(carry_id).or_default().push(CarryItem {
+            name,
+            icon: icon.unwrap_or_default(), // icon 없으면 빈 문자열
+            avg,
+        });
+    }
+    Ok(map)
 }

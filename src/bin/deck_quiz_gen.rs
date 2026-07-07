@@ -15,12 +15,12 @@
 //!
 //! 실행:  cargo run --bin deck_quiz_gen
  
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
  
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
  
-const RAW_MIN_GAMES: i64 = 70; // 원시 덱 최소 표본
+const RAW_MIN_GAMES: i64 = 110; // 원시 덱 최소 표본
 const N_OPTIONS: usize = 4; // 보기 개수 (정답 1 + 오답 3)
 // const MIN_CORE: usize = 6; // 코어가 이보다 적으면 덱 스킵 (정체성 불명확)
 const MAX_APPEAR_RATE: f64 = 0.30; // 등장률 30% 초과 = 순수 접착제 → 정답 제외
@@ -43,6 +43,14 @@ async fn main() -> anyhow::Result<()> {
  
     let meta = Meta::load(set_number, false).await?;
 
+    let carry_items: std::collections::HashMap<String, Vec<db::CarryItem>> = db::load_carry_top_items(&pool).await?;
+    eprintln!("캐리 아이템 맵 로드: {} 캐리", carry_items.len());
+
+
+    for (k, v) in carry_items.iter().take(5) {
+        eprintln!("  키: '{}' → {} 아이템", k, v.len());
+    }
+
     // 1~3단계: 원시 덱 → 흡수 → 티어덱
     // 임시: 표본별 덱 수 확인
     for threshold in [50i64, 100, 150, 200] {
@@ -52,12 +60,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let raw = db::raw_decks(&pool, &patch, RAW_MIN_GAMES).await?;
+    // raw 선언 다음
+    if let Some(first) = raw.first() {
+        eprintln!("덱 유닛 예시: {:?}", first.units);
+    }
     let tier_decks: Vec<db::RawDeck> = raw
         .into_iter()
         .filter(|d| d.avg_placement <= 5.0)
         .collect();
     eprintln!("티어덱 {}개", tier_decks.len());
- 
+
     // 유닛별 전체 등장률 (정답 필터용) — 너무 흔한 유닛은 정답에서 제외
     let (unit_appears, total_boards) = db::unit_appearance_rates(&pool, &patch).await?;
 
@@ -101,6 +113,32 @@ async fn main() -> anyhow::Result<()> {
             Some(trait_id) => meta.trait_name(&trait_id),
             None => deck.units.first().map(|u| meta.unit_name(u)).unwrap_or_default(),
         };
+
+        
+        let mut sorted_units = deck.units.clone();
+        sorted_units.sort();
+
+        let units_json: Vec<serde_json::Value> = deck.units.iter().map(|uid| {
+            match carry_items.get(uid) {
+                Some(items) => serde_json::json!({
+                    "id": uid, "name": meta.unit_name(uid), "items": items,
+                }),
+                None => serde_json::json!({
+                    "id": uid, "name": meta.unit_name(uid),
+                }),
+            }
+        }).collect();
+
+        
+        let mut sorted = deck.units.clone();
+        sorted.sort();
+        let deck_key = sorted.join(",");
+
+        db::upsert_deck_stats(
+            &pool, &deck_key, &patch, set_number,
+            &serde_json::json!(units_json),
+            &deck_label, deck.avg_placement, deck.games,
+        ).await?;
 
         // 코어 유닛을 하나씩 빼서 문제 생성 (시그니처 코어만 정답)
         for removed in &signature_core {

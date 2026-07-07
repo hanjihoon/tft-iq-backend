@@ -7,8 +7,6 @@
 use crate::error::Result;
 use std::collections::HashMap;
 
-const CDRAGON_KO: &str = "https://raw.communitydragon.org/latest/cdragon/tft/ko_kr.json";
-
 pub struct UnitMeta {
     pub name: String,
     pub cost: i32,

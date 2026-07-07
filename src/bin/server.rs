@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/quiz/review/count", get(review_counts))
         .route("/api/quiz/stats", get(user_stats_handler))
         .route("/api/quiz/reset", post(reset_handler))
+        .route("/api/quiz/{id}/report", post(report_puzzle))
+        .route("/api/meta/decks", get(meta_decks_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -253,7 +255,7 @@ async fn next_unsolved(
     } else {
         db::unsolved_puzzle_by_type(&st.pool, user_id, ptype, &current_patch).await?
     };
-    
+
     match puzzle {
         Some(p) => Ok(Json(serde_json::json!({
             "status": "ok",
@@ -308,4 +310,25 @@ async fn reset_handler(
     let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
     let deleted = db::reset_attempts(&st.pool, user_id).await?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+async fn report_puzzle(
+    State(st): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+    db::insert_report(&st.pool, id, user_id, None).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+
+async fn meta_decks_handler(
+    State(st): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    // 현재 패치 (표본 임계 넘는 최신)
+    let patch = match db::current_patch_info(&st.pool).await? {
+        Some(info) => info.patch,
+        None => return Ok(Json(vec![])), // 패치 없으면 빈 목록
+    };
+    let decks = db::meta_decks(&st.pool, &patch).await?;
+    Ok(Json(decks))
 }

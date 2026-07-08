@@ -7,17 +7,35 @@
 use crate::error::Result;
 use std::collections::HashMap;
 
-pub struct UnitMeta {
-    pub name: String,
-    pub cost: i32,
-    pub traits: Vec<String>,
-}
 
 pub struct Meta {
     pub augments: HashMap<String, String>,
     pub units: HashMap<String, UnitMeta>,
     pub items: HashMap<String, String>,
     pub traits: HashMap<String, String>,   // apiName → 한글 (예: TFT17_Divine → 신성)
+    pub trait_details: HashMap<String, TraitMeta>,  // 추가 (icon, breakpoints)
+}
+
+pub struct UnitMeta {
+    pub name: String,
+    pub cost: i32,
+    pub traits: Vec<String>,
+    pub ability: Option<SkillMeta>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SkillMeta {
+    pub name: String,
+    pub icon: String,        // 변환된 URL
+    pub desc: String,
+    pub variables: serde_json::Value,  // [{name, value:[...]}] 그대로
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct TraitMeta {
+    pub name: String,
+    pub icon: String,
+    pub breakpoints: Vec<(i32, i32)>,  // (minUnits, style)
 }
 
 impl Meta {
@@ -34,6 +52,27 @@ impl Meta {
 
         let mut augments = HashMap::new();
         let mut items = HashMap::new();
+
+        fn skill_icon_url(raw: &str) -> String {
+            if raw.is_empty() {
+                return String::new();
+            }
+            // 1. 소문자화
+            let low = raw.to_lowercase();
+            // 2. .tex → .png
+            let png = low.replace(".tex", ".png");
+            // 3. cdragon URL (ASSETS/ 는 경로에 그대로, game/ 아래로)
+            format!("https://raw.communitydragon.org/latest/game/{}", png)
+        }
+
+        
+        fn trait_icon_url(raw: &str) -> String {
+            if raw.is_empty() { return String::new(); }
+            let low = raw.to_lowercase();
+            let png = low.replace(".tex", ".png");
+            format!("https://raw.communitydragon.org/latest/game/{}", png)
+        }
+
 
         // 최상위 "items"에 일반 아이템과 오그먼트가 섞여 있다.
         if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
@@ -59,6 +98,7 @@ impl Meta {
         // 세트별 챔피언 + 특성은 "setData" 배열에서 number로 찾는다.
         let mut units = HashMap::new();
         let mut traits = HashMap::new();
+        let mut trait_details = HashMap::new();
         if let Some(sets) = v.get("setData").and_then(|x| x.as_array()) {
             for s in sets {
                 if s.get("number").and_then(|n| n.as_i64()) != Some(set_number as i64) {
@@ -76,6 +116,21 @@ impl Meta {
                         if !name.is_empty() {
                             traits.insert(id.to_string(), name.to_string());
                         }
+
+                        // 추가: trait_details (icon, breakpoints)
+                        let icon = trait_icon_url(t.get("icon").and_then(|x| x.as_str()).unwrap_or(""));
+                        let breakpoints: Vec<(i32, i32)> = t.get("effects")
+                            .and_then(|e| e.as_array())
+                            .map(|arr| arr.iter().filter_map(|e| {
+                                let min = e.get("minUnits")?.as_i64()? as i32;
+                                let style = e.get("style")?.as_i64()? as i32;
+                                Some((min, style))
+                            }).collect())
+                            .unwrap_or_default();
+
+                        trait_details.insert(name.to_string(), TraitMeta {  // 한글명 키!
+                            name: name.to_string(), icon, breakpoints,
+                        });
                     }
                 }
                 if let Some(champs) = s.get("champions").and_then(|c| c.as_array()) {
@@ -98,13 +153,19 @@ impl Meta {
                             })
                             .unwrap_or_default();
 
+                        // 스킬(ability) 파싱
+                        let ability = c.get("ability").and_then(|ab| {
+                            let name = ab.get("name").and_then(|x| x.as_str())?.to_string();
+                            let desc = ab.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let icon_raw = ab.get("icon").and_then(|x| x.as_str()).unwrap_or("");
+                            let icon = skill_icon_url(icon_raw);
+                            let variables = ab.get("variables").cloned().unwrap_or(serde_json::json!([]));
+                            Some(SkillMeta { name, icon, desc, variables })
+                        });
+
                         units.insert(
                             id.to_string(),
-                            UnitMeta {
-                                name: name.to_string(),
-                                cost,
-                                traits,
-                            },
+                            UnitMeta { name: name.to_string(), cost, traits, ability },
                         );
                     }
                 }
@@ -117,6 +178,7 @@ impl Meta {
             units,
             items,
             traits,
+            trait_details,
         })
     }
 

@@ -19,7 +19,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use tft_iq::{AppError, Config, db};
+use tft_iq::{AppError, Config, db, meta::Meta};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/quiz/reset", post(reset_handler))
         .route("/api/quiz/{id}/report", post(report_puzzle))
         .route("/api/meta/decks", get(meta_decks_handler))
+        .route("/api/meta/units", get(meta_units_handler))
+        .route("/api/meta/traits", get(meta_traits_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -331,4 +333,44 @@ async fn meta_decks_handler(
     };
     let decks = db::meta_decks(&st.pool, &patch).await?;
     Ok(Json(decks))
+}
+
+async fn meta_units_handler(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let patch = match db::current_patch_info(&st.pool).await? {
+        Some(info) => info,
+        None => return Ok(Json(serde_json::json!({}))),
+    };
+    let meta = Meta::load(patch.set_number, false).await?;
+
+    let info: serde_json::Map<String, serde_json::Value> = meta.units.iter()
+        .map(|(id, u)| {
+            (id.clone(), serde_json::json!({
+                "cost": u.cost,
+                "traits": u.traits,
+                "ability": u.ability,  // SkillMeta (Serialize)
+            }))
+        })
+        .collect();
+
+    Ok(Json(serde_json::Value::Object(info)))
+} 
+
+async fn meta_traits_handler(
+    State(st): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let patch = match db::current_patch_info(&st.pool).await? {
+        Some(info) => info,
+        None => return Ok(Json(serde_json::json!({}))),
+    };
+    let meta = Meta::load(patch.set_number, false).await?;
+
+    // 한글명 키로 맵 구성 (프론트 유닛 traits가 한글명이라 매칭 편함)
+    let mut out = serde_json::Map::new();
+    for (name, t) in meta.trait_details.iter() {
+        out.insert(name.clone(), serde_json::json!({
+            "icon": t.icon,
+            "breakpoints": t.breakpoints,
+        }));
+    }
+    Ok(Json(serde_json::Value::Object(out)))
 }

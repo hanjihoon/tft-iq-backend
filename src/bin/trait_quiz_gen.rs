@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let meta = Meta::load(set_number, use_pbe).await?;
 
     // 전체 특성 한글명 (오답 풀)
-    let all_traits: Vec<String> = meta.traits.values().cloned().collect();
+let all_traits: Vec<String> = meta.traits.values().cloned().collect();
     if all_traits.len() < 6 {
         eprintln!("특성이 너무 적음 ({}) — 스킵", all_traits.len());
         return Ok(());

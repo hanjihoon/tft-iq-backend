@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
 
@@ -17,10 +19,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (set_number, patch) = (info.set_number, info.patch.clone());
-    let meta = Meta::load(set_number, use_pbe).await?;
+    let meta = Meta::load_with_lang(set_number, "ko_kr", use_pbe).await?;
 
     // 전체 특성 한글명 (오답 풀)
-let all_traits: Vec<String> = meta.traits.values().cloned().collect();
+    let all_traits: Vec<String> = meta.traits.keys().cloned().collect();
     if all_traits.len() < 6 {
         eprintln!("특성이 너무 적음 ({}) — 스킵", all_traits.len());
         return Ok(());
@@ -52,7 +54,8 @@ let all_traits: Vec<String> = meta.traits.values().cloned().collect();
             .collect();
 
         // 보기 = 정답 + 오답 섞기
-        let mut options: Vec<String> = answer.clone();
+        let options: Vec<String> = answer.clone();
+        let mut options: Vec<String> = normalize_traits(&options);
         options.extend(distractors);
         options.shuffle(&mut rng);
 
@@ -69,14 +72,18 @@ let all_traits: Vec<String> = meta.traits.values().cloned().collect();
         });
 
         let stats = serde_json::json!({ "trait_count": answer.len() });
+        
+        let mut answer_apis: Vec<String> = u.traits.clone();  // 이미 apiName
+        answer_apis.sort();
+        let trait_apis: Vec<String> = normalize_traits(&answer_apis);
 
-        let answer_str = answer.join(","); // "우주 그루브,저격수"
+        let answer = trait_apis.join(",");  // "TFT17_Sniper,TFT17_XXX"
 
         // ... prompt, stats 만들기 (기존) ...
 
         db::insert_trait_puzzle(
             &pool, "trait_quiz", &patch, set_number, uid,
-            &answer_str,      // 추가
+            &normalize_trait(&answer),
             &prompt, &stats,
         )
         .await?;
@@ -96,4 +103,25 @@ fn unit_icon(id: &str, set: i32) -> String {
     format!(
         "https://raw.communitydragon.org/latest/game/assets/characters/{low}/hud/{file_base}_square.tft_set{set}.png"
     )
+}
+
+fn normalize_trait(api: &str) -> String {
+    // 별돌보미 변종 통합: TFT17_Stargazer_XXX → TFT17_Stargazer
+    if api.starts_with("TFT17_Stargazer_") {
+        return "TFT17_Stargazer".to_string();
+    }
+    api.to_string()
+}
+
+fn normalize_traits(traits: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for t in traits {
+        let normalized = normalize_trait(t);
+        // 중복 아니면 추가 (순서 유지)
+        if seen.insert(normalized.clone()) {
+            result.push(normalized);
+        }
+    }
+    result
 }

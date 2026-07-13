@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use tft_iq::{AppError, Config, db, meta::Meta};
 use tower_http::cors::CorsLayer;
@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/meta/decks", get(meta_decks_handler))
         .route("/api/meta/units", get(meta_units_handler))
         .route("/api/meta/traits", get(meta_traits_handler))
+        .route("/api/meta/items", get(meta_items_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -76,6 +77,12 @@ async fn main() -> anyhow::Result<()> {
 async fn health() -> &'static str {
     "ok"
 }
+
+#[derive(Deserialize)]
+struct MetaQuery {
+    lang: Option<String>,
+}
+
 
 #[derive(Serialize)]
 struct PuzzleView {
@@ -335,16 +342,22 @@ async fn meta_decks_handler(
     Ok(Json(decks))
 }
 
-async fn meta_units_handler(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn meta_units_handler(
+    Query(q): Query<MetaQuery>,
+    State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let patch = match db::current_patch_info(&st.pool).await? {
         Some(info) => info,
         None => return Ok(Json(serde_json::json!({}))),
     };
-    let meta = Meta::load(patch.set_number, false).await?;
+    let lang = q.lang.unwrap_or_else(|| "ko_kr".into());
+    // 언어 화이트리스트 (안전 — 아무 문자열이나 URL에 넣으면 위험)
+    let lang = validate_lang(&lang);
+    let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
 
     let info: serde_json::Map<String, serde_json::Value> = meta.units.iter()
         .map(|(id, u)| {
             (id.clone(), serde_json::json!({
+                "name": u.name, 
                 "cost": u.cost,
                 "traits": u.traits,
                 "ability": u.ability,  // SkillMeta (Serialize)
@@ -356,21 +369,56 @@ async fn meta_units_handler(State(st): State<AppState>) -> Result<Json<serde_jso
 } 
 
 async fn meta_traits_handler(
+    Query(q): Query<MetaQuery>,
     State(st): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let patch = match db::current_patch_info(&st.pool).await? {
         Some(info) => info,
         None => return Ok(Json(serde_json::json!({}))),
     };
-    let meta = Meta::load(patch.set_number, false).await?;
+    let lang = q.lang.unwrap_or_else(|| "ko_kr".into());
+    // 언어 화이트리스트 (안전 — 아무 문자열이나 URL에 넣으면 위험)
+    let lang = validate_lang(&lang);
+    let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
 
     // 한글명 키로 맵 구성 (프론트 유닛 traits가 한글명이라 매칭 편함)
     let mut out = serde_json::Map::new();
-    for (name, t) in meta.trait_details.iter() {
-        out.insert(name.clone(), serde_json::json!({
+    for (api, t) in meta.trait_details.iter() {  // api = apiName
+        out.insert(api.clone(), serde_json::json!({
+            "name": t.name,      // 이름 추가! (프론트가 표시용)
             "icon": t.icon,
             "breakpoints": t.breakpoints,
+            "desc": t.desc,
+            "effects": t.effects,
         }));
     }
     Ok(Json(serde_json::Value::Object(out)))
+}
+
+async fn meta_items_handler(
+    Query(q): Query<MetaQuery>,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let patch = match db::current_patch_info(&st.pool).await? {
+        Some(info) => info,
+        None => return Ok(Json(serde_json::json!({}))),
+    };
+    let lang = validate_lang(&q.lang.unwrap_or_else(|| "ko_kr".into()));
+    // patch, set_number 가져오기 (다른 핸들러처럼)
+    let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
+
+    // items 맵을 그대로 JSON으로
+    let out: serde_json::Map<String, Value> = meta.items.iter()
+        .map(|(api, name)| (api.clone(), Value::String(name.clone())))
+        .collect();
+    Ok(Json(Value::Object(out)))
+}
+
+fn validate_lang(lang: &str) -> String {
+    const ALLOWED: &[&str] = &[
+        "ko_kr", "en_us", "ja_jp", "zh_cn", "pt_br",
+        "es_mx", "fr_fr", "de_de", "ru_ru", "vi_vn", "th_th",
+    ];
+    if ALLOWED.contains(&lang) { lang.to_string() }
+    else { "ko_kr".to_string() }  // 기본 폴백
 }

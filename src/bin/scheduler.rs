@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let interval_secs: u64 = std::env::var("SCHED_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(14400); // 4시간
+        .unwrap_or(172800); // 48시간
 
     eprintln!("스케줄러 시작 — {interval_secs}초마다 반복");
 

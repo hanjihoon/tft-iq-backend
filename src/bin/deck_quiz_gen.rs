@@ -41,17 +41,10 @@ async fn main() -> anyhow::Result<()> {
     let (set_number, patch) = (info.set_number, info.patch.clone());
     eprintln!("대상: set {set_number}, patch {patch}");
  
-    let meta = Meta::load(set_number, false).await?;
+    let meta = Meta::load_with_lang(set_number, "ko_kr", false).await?;
 
     let carry_items: std::collections::HashMap<String, Vec<db::CarryItem>> = db::load_carry_top_items(&pool).await?;
-    eprintln!("캐리 아이템 맵 로드: {} 캐리", carry_items.len());
 
-
-    for (k, v) in carry_items.iter().take(5) {
-        eprintln!("  키: '{}' → {} 아이템", k, v.len());
-    }
-
-    // 1~3단계: 원시 덱 → 흡수 → 티어덱
     // 임시: 표본별 덱 수 확인
     for threshold in [50i64, 100, 150, 200] {
         let d = db::raw_decks(&pool, &patch, threshold).await?;
@@ -110,8 +103,10 @@ async fn main() -> anyhow::Result<()> {
 
         // 이름은 특성만
         let deck_label = match db::deck_signature_trait(&pool, &patch, &deck.units).await? {
-            Some(trait_id) => meta.trait_name(&trait_id),
-            None => deck.units.first().map(|u| meta.unit_name(u)).unwrap_or_default(),
+            Some(trait_id) => format!("trait:{}", trait_id),   // "trait:TFT17_Sniper"
+            None => deck.units.first()
+                .map(|u| format!("unit:{}", u))                 // "unit:TFT17_Veigar"
+                .unwrap_or_default(),
         };
 
         

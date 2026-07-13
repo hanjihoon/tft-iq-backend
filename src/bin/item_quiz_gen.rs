@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let (set_number, patch) = (info.set_number, info.patch.clone());
     eprintln!("대상: set {set_number}, patch {patch}");
 
-    let meta = Meta::load(set_number, false).await?;
+    let meta = Meta::load_with_lang(set_number, "ko_kr", false).await?;
     let mut rng = rand::thread_rng();
 
     let carries = db::carry_candidates(&pool, set_number, &patch, MIN_CARRY_APPEARANCES).await?;

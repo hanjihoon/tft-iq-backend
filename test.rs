@@ -3,30 +3,26 @@ use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-
-    fn search_max_prequence(vec: Vec<i32>) -> i32 {
-
-        let mut count_map : HashMap<i32, i32> = HashMap::new();
-
-        for v in vec {
-            *count_map.entry(v).or_insert(0) += 1;
-        }
-
-        let mut count_key : i32 = 0;
-        let mut count_value : i32 = 0;
-
-        for (key, value) in count_map.iter() {
-            if *value > count_value { 
-                count_value = *value;
-                count_key = *key;
-            }
-        }
-
-        count_key
+    fn square_not_divisible_by_three(vec: Vec<i32>) -> Vec<i32> {
+        
+        vec.into_iter().filter(|n| n % 3 != 0)
+        .map(|n| n * n)
+        .collect()
 
     }
 
-    println!("a1 확인 결과 : {}", search_max_prequence(vec![1, 3, 3, 2, 3, 2]));
+    fn uppercase_long_words(vec: Vec<String>) -> Vec<String> {
+        
+        vec.into_iter().filter(|str| str.len() >= 5)
+        .map(|str| str.to_uppercase())
+        .collect()
+
+    }
+
+    let input = vec![1, 2, 3, 4, 5, 6];
+    let output = square_not_divisible_by_three(input);
+    println!("{:?}", output); // 예상 결과: [4, 8] (2와 4가 각각 2배가 됨)
+
     Ok(())
 }
 

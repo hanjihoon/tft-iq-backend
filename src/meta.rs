@@ -36,17 +36,21 @@ pub struct TraitMeta {
     pub name: String,
     pub icon: String,
     pub breakpoints: Vec<(i32, i32)>,  // (minUnits, style)
+    pub desc: String,
+    pub effects: serde_json::Value,
 }
 
 impl Meta {
     /// 특정 세트의 메타데이터를 로드.
-    pub async fn load(set_number: i32, use_pbe: bool) -> Result<Self> {
+    pub async fn load_with_lang(set_number: i32, lang: &str, use_pbe: bool) -> Result<Self> {
         // 메타 로드는 1회성이라 기본 클라이언트로 충분
         let url = if use_pbe {
-            "https://raw.communitydragon.org/pbe/cdragon/tft/ko_kr.json"
-        } else {
-            "https://raw.communitydragon.org/latest/cdragon/tft/ko_kr.json"
-        };
+            format!("https://raw.communitydragon.org/pbe/cdragon/tft/{}.json",
+            lang
+        )} else {
+            format!("https://raw.communitydragon.org/latest/cdragon/tft/{}.json",
+            lang
+        )};
 
         let v: serde_json::Value = reqwest::get(url).await?.json().await?;
 
@@ -117,6 +121,7 @@ impl Meta {
                             traits.insert(id.to_string(), name.to_string());
                         }
 
+
                         // 추가: trait_details (icon, breakpoints)
                         let icon = trait_icon_url(t.get("icon").and_then(|x| x.as_str()).unwrap_or(""));
                         let breakpoints: Vec<(i32, i32)> = t.get("effects")
@@ -128,8 +133,15 @@ impl Meta {
                             }).collect())
                             .unwrap_or_default();
 
-                        trait_details.insert(name.to_string(), TraitMeta {  // 한글명 키!
-                            name: name.to_string(), icon, breakpoints,
+                        let desc = t.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let effects = t.get("effects").cloned().unwrap_or(serde_json::json!([]));
+
+                        trait_details.insert(id.to_string(), TraitMeta {
+                            name: name.to_string(),
+                            icon,
+                            breakpoints,
+                            desc,
+                            effects,
                         });
                     }
                 }
@@ -141,17 +153,24 @@ impl Meta {
                         ) else {
                             continue;
                         };
-                        let cost = c.get("cost").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-                        // 유닛의 특성 배열 (예: ["우주 그루브", "저격수"])
-                        let traits: Vec<String> = c
-                            .get("traits")
+
+                        // traits(apiName → 한글)가 이미 채워진 후, 역매핑 생성
+                        let name_to_api: HashMap<String, String> = traits.iter()
+                            .map(|(api, name)| (name.clone(), api.clone()))
+                            .collect();
+
+                        // 유닛 파싱 루프에서 traits를 apiName으로
+                        let trait_names: Vec<String> = c.get("traits")
                             .and_then(|t| t.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
+                            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
+
+                        // 한글 → apiName 변환
+                        let trait_apis: Vec<String> = trait_names.iter()
+                            .filter_map(|kr| name_to_api.get(kr).cloned())
+                            .collect();
+
+                        let cost = c.get("cost").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
 
                         // 스킬(ability) 파싱
                         let ability = c.get("ability").and_then(|ab| {
@@ -165,7 +184,7 @@ impl Meta {
 
                         units.insert(
                             id.to_string(),
-                            UnitMeta { name: name.to_string(), cost, traits, ability },
+                            UnitMeta { name: name.to_string(), cost, traits: trait_apis, ability },
                         );
                     }
                 }

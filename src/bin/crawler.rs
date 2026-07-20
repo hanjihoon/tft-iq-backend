@@ -11,7 +11,7 @@ use tft_iq::{Config, db, riot::RiotClient};
 use tracing::{info, warn};
 
 /// 한 사이클에 처리할 플레이어 수
-const PLAYERS_PER_CYCLE: i64 = 50;
+const PLAYERS_PER_CYCLE: i64 = 200;
 /// 티어별 사용할 최대 플레이어 수
 const MAX_PLAYERS_PER_TIER: usize = 500;
 /// 증분 조회 시 마지막 수집 시각에서 빼는 안전 마진(초). 막 끝난 게임 누락 방지.
@@ -88,23 +88,23 @@ async fn main() -> anyhow::Result<()> {
     info!("크롤 완료. 신규 매치 {total_new}건 저장.");
     db::reconcile_patch_versions(&pool).await?;
 
-    // 크롤러 사이클 끝, patch_versions 갱신 후
-    let total = db::total_match_count(&pool).await?;
-    if total > MAX_MATCHES {
-        match db::current_patch_info(&pool).await? {
-            Some(info) => {
-                let deleted = db::prune_matches(&pool, MAX_MATCHES, &info.patch).await?;
-                eprintln!("매치 정리: {} 삭제 → {} 유지 (현재 패치 {} 보존)",
-                    deleted, MAX_MATCHES, info.patch);
-            }
-            None => {
-                // 표본 임계 넘는 패치가 아직 없음 (예: 서비스 초기)
-                // → 현재 패치를 특정 못 하니, 안전하게 시간순으로만 정리
-                let deleted = db::prune_matches_by_time(&pool, MAX_MATCHES).await?;
-                eprintln!("매치 정리(시간순): {} 삭제 → {} 유지", deleted, MAX_MATCHES);
-            }
-        }
-    }
+    // // 크롤러 사이클 끝, patch_versions 갱신 후
+    // let total = db::total_match_count(&pool).await?;
+    // if total > MAX_MATCHES {
+    //     match db::current_patch_info(&pool).await? {
+    //         Some(info) => {
+    //             let deleted = db::prune_matches(&pool, MAX_MATCHES, &info.patch).await?;
+    //             eprintln!("매치 정리: {} 삭제 → {} 유지 (현재 패치 {} 보존)",
+    //                 deleted, MAX_MATCHES, info.patch);
+    //         }
+    //         None => {
+    //             // 표본 임계 넘는 패치가 아직 없음 (예: 서비스 초기)
+    //             // → 현재 패치를 특정 못 하니, 안전하게 시간순으로만 정리
+    //             let deleted = db::prune_matches_by_time(&pool, MAX_MATCHES).await?;
+    //             eprintln!("매치 정리(시간순): {} 삭제 → {} 유지", deleted, MAX_MATCHES);
+    //         }
+    //     }
+    // }
 
     Ok(())
 }

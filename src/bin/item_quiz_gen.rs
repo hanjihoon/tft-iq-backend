@@ -1,14 +1,3 @@
-//! 아이템 BIS 퀴즈 생성기 (캐리 타입 + 계열 일치 오답).
-//!
-//! 난이도 정책:
-//!   dealer  → 오답을 정답과 같은 계열에서만 (AD캐리=AD오답) → 소거 불가, 어려움
-//!   bruiser → 오답에 딜템 + 브루저/방어템 혼합 → "딜 vs 탱" 트레이드오프
-//!   tank/애매 → 제외 (정체성 불명확)
-//!
-//! 정답은 항상 데이터(BIS 1위)가 정한다. 계열은 "오답 풀"에만 관여.
-//!
-//! 실행:  cargo run --bin item_quiz_gen
-
 use std::collections::HashSet;
 
 use rand::seq::SliceRandom;
@@ -22,7 +11,7 @@ use tft_iq::{
 const MIN_CARRY_APPEARANCES: i64 = 30;
 const SHRINK_C: f64 = 25.0; // 수축 강도 (가상 사전표본 개수)
 const MIN_LIFT: f64 = 2.0;    // 풀템 기준 lift. 이 미만은 범용템 → 제외
-const MIN_ITEM_PICKS: i64 = 10;
+const MIN_ITEM_PICKS: i64 = 30;
 
 
 fn adjusted(avg: f64, picks: i64, prior_mean: f64) -> f64 {
@@ -177,11 +166,11 @@ async fn main() -> anyhow::Result<()> {
             })),
         });
 
-        db::insert_item_puzzle(
-            &pool, set_number, &patch, carry_id, carry_type_str(carry_type),
-            &serde_json::to_value(&prompt)?, &serde_json::to_value(&options)?,
-            &answer.item, &stats_payload,
-        ).await?;
+        // db::insert_item_puzzle(
+        //     &pool, set_number, &patch, carry_id, carry_type_str(carry_type),
+        //     &serde_json::to_value(&prompt)?, &serde_json::to_value(&options)?,
+        //     &answer.item, &stats_payload,
+        // ).await?;
         made += 1;
     }
 

@@ -135,6 +135,7 @@ pub async fn load_matches(
         r#"
         SELECT raw FROM raw_matches
         WHERE set_number = $1 AND patch = $2
+        AND raw->'info'->>'queue_id' = '1100'
         ORDER BY game_datetime DESC
         LIMIT $3
         "#,
@@ -145,6 +146,30 @@ pub async fn load_matches(
     .fetch_all(pool)
     .await?;
 
+    let mut out = Vec::with_capacity(rows.len());
+    for (raw,) in rows {
+        // 스키마가 안 맞는 옛 매치는 조용히 스킵
+        if let Ok(m) = serde_json::from_value::<Match>(raw) {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+pub async fn load_matches_after(
+    pool: &PgPool, set_number: i32, patch: &str, after: DateTime<Utc>,
+) -> Result<Vec<Match>> {
+    // fecth_datetime > after 인 것만
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        r#"SELECT raw FROM raw_matches
+           WHERE set_number = $1 AND patch = $2 AND fecth_datetime > $3
+           AND raw->'info'->>'queue_id' = '1100'
+           ORDER BY game_datetime DESC"#,
+    )
+    .bind(set_number).bind(patch).bind(after)
+    .fetch_all(pool).await?;
+
+    // 역직렬화
     let mut out = Vec::with_capacity(rows.len());
     for (raw,) in rows {
         // 스키마가 안 맞는 옛 매치는 조용히 스킵
@@ -709,6 +734,7 @@ pub async fn insert_item_puzzle(
     set_number: i32,
     patch: &str,
     carry_id: &str,
+    variant: &str,
     carry_type: &str,
     prompt: &serde_json::Value,
     options: &serde_json::Value,
@@ -720,7 +746,7 @@ pub async fn insert_item_puzzle(
         INSERT INTO puzzles
             (puzzle_type, set_number, patch, carry_id, variant, carry_type,
              prompt, options, answer, stats, source_match_id)
-        VALUES ('item_combine', $1, $2, $3, 'bis', $4, $5, $6, $7, $8, NULL)
+        VALUES ('item_combine', $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
         ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL
         DO UPDATE SET
             carry_type = EXCLUDED.carry_type,
@@ -731,9 +757,17 @@ pub async fn insert_item_puzzle(
             set_number = EXCLUDED.set_number
         "#,
     )
-    .bind(set_number).bind(patch).bind(carry_id).bind(carry_type)
-    .bind(prompt).bind(options).bind(answer).bind(stats)
-    .execute(pool).await?;
+    .bind(set_number)
+    .bind(patch)
+    .bind(carry_id)
+    .bind(variant)       // $4
+    .bind(carry_type)    // $5
+    .bind(prompt)        // $6
+    .bind(options)       // $7
+    .bind(answer)        // $8
+    .bind(stats)         // $9
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1412,4 +1446,100 @@ pub async fn load_carry_top_items(pool: &PgPool) -> Result<HashMap<String, Vec<C
         });
     }
     Ok(map)
+}
+
+/// 아이템 전체 정보 (id → name, icon) 맵으로 로드
+pub async fn all_item_info(
+    pool: &PgPool,
+) -> Result<HashMap<String, (String, String)>> {
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT item_id, name, COALESCE(icon_url, '') FROM item_classifications",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, icon)| (id, (name, icon)))
+        .collect())
+}
+
+/// 캐리 목록 (carry_stats에서, total 임계 이상)
+#[derive(Debug, Clone)]
+pub struct CarryInfo {
+    pub carry_id: String,
+    pub total_appearances: i64,
+    pub is_tank: bool,
+}
+
+pub async fn carry_list_for_combo(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    min_appearances: i64,
+) -> Result<Vec<CarryInfo>> {
+    let rows = sqlx::query_as::<_, (String, i64, bool)>(
+        r#"
+        SELECT carry_id, total_appearances, is_tank
+        FROM carry_stats
+        WHERE set_number = $1 AND patch = $2
+          AND is_carry = true
+          AND total_appearances >= $3
+        ORDER BY total_appearances DESC
+        "#,
+    )
+    .bind(set_number)
+    .bind(patch)
+    .bind(min_appearances)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(carry_id, total_appearances, is_tank)| CarryInfo {
+            carry_id,
+            total_appearances,
+            is_tank,
+        })
+        .collect())
+}
+
+/// 캐리의 3템 조합 통계 (픽률 순, min_picks 이상)
+#[derive(Debug, Clone)]
+pub struct ComboStat {
+    pub item_combo: String, // "TFT_Item_A,TFT_Item_B,TFT_Item_C"
+    pub picks: i64,
+    pub avg_placement: f64,
+    pub tank_item_count: i32,
+}
+
+pub async fn combo_stats_for_carry(
+    pool: &PgPool,
+    set_number: i32,
+    patch: &str,
+    carry_id: &str,
+    min_picks: i64,
+) -> Result<Vec<ComboStat>> {
+    let rows = sqlx::query_as::<_, (String, i64, f32, i32)>(
+        r#"
+        SELECT item_combo, pick_count, avg_placement, tank_item_count
+        FROM item_combo_stats
+        WHERE set_number = $1 AND patch = $2 AND carry_id = $3
+          AND pick_count >= $4
+        ORDER BY pick_count DESC
+        "#,
+    )
+    .bind(set_number)
+    .bind(patch)
+    .bind(carry_id)
+    .bind(min_picks)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(item_combo, picks, avg, tank)| ComboStat {
+            item_combo,
+            picks,
+            avg_placement: avg as f64,
+            tank_item_count: tank,
+        })
+        .collect())
 }

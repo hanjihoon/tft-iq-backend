@@ -20,7 +20,7 @@ use std::collections::{HashSet};
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
  
-const RAW_MIN_GAMES: i64 = 110; // 원시 덱 최소 표본
+const RAW_MIN_GAMES: i64 = 150; // 원시 덱 최소 표본
 const N_OPTIONS: usize = 4; // 보기 개수 (정답 1 + 오답 3)
 // const MIN_CORE: usize = 6; // 코어가 이보다 적으면 덱 스킵 (정체성 불명확)
 const MAX_APPEAR_RATE: f64 = 0.30; // 등장률 30% 초과 = 순수 접착제 → 정답 제외

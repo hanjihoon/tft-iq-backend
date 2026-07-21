@@ -10,7 +10,7 @@ primary_region = "nrt"          # 도쿄
   RIOT_PLATFORM = "kr"
   RIOT_REGION = "asia"
   BIND_ADDR = "0.0.0.0:8080"
-  SCHED_INTERVAL_SECS = "14400"  # 4시간마다
+  SCHED_INTERVAL_SECS = "172800"  # 48시간마다
 
 # 프로세스 2개: app = API 서버, worker = 스케줄러
 [processes]

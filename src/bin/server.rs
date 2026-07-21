@@ -61,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/meta/units", get(meta_units_handler))
         .route("/api/meta/traits", get(meta_traits_handler))
         .route("/api/meta/items", get(meta_items_handler))
+        .route("/api/carry/specials-list", get(carry_specials_list))
+        .route("/api/carry/{carry_id}/specials", get(carry_specials))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive()) // 개발용. 운영에선 도메인 제한.
         .with_state(state);
@@ -421,4 +423,57 @@ fn validate_lang(lang: &str) -> String {
     ];
     if ALLOWED.contains(&lang) { lang.to_string() }
     else { "ko_kr".to_string() }  // 기본 폴백
+}
+
+
+/// GET /api/carry/{carry_id}/specials
+/// 캐리별 추천 유물 2 + 상징 2
+async fn carry_specials(
+    Path(carry_id): Path<String>,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(info) = db::current_patch_info(&st.pool).await? else {
+        return Ok(Json(json!({
+            "carry_id": carry_id, "artifacts": [], "emblems": []
+        })));
+    };
+
+    const MIN_PICKS: i64 = 15;
+    const LIMIT: i64 = 2;
+
+    let to_json = |recs: Vec<db::SpecialRec>| -> Vec<Value> {
+        recs.into_iter().map(|r| json!({
+            "item_id": r.item_id,
+            "name": r.name,
+            "icon": r.icon_url,
+            "avg_placement": (r.avg_placement * 100.0).round() / 100.0,
+            "picks": r.picks,
+        })).collect()
+    };
+
+    let artifacts = to_json(db::special_recs_for_carry(
+        &st.pool, info.set_number, &info.patch, &carry_id, "artifact", MIN_PICKS, LIMIT,
+    ).await?);
+
+    let emblems = to_json(db::special_recs_for_carry(
+        &st.pool, info.set_number, &info.patch, &carry_id, "emblem", MIN_PICKS, LIMIT,
+    ).await?);
+
+    Ok(Json(json!({
+        "carry_id": carry_id,
+        "patch": info.patch,
+        "artifacts": artifacts,
+        "emblems": emblems,
+    })))
+}
+
+/// 특수템 데이터(표본 15+)가 있는 캐리 id 목록
+async fn carry_specials_list(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(info) = db::current_patch_info(&st.pool).await? else {
+        return Ok(Json(json!([])));
+    };
+    let ids = db::carry_specials_list(&st.pool, info.set_number, &info.patch).await?;
+    Ok(Json(json!(ids)))
 }

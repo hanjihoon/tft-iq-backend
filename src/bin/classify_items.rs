@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         let Some(comp) = it.get("composition").and_then(|x| x.as_array()) else {
             continue;
         };
+        
         if comp.len() != 2 || name.is_empty() {
             continue;
         }

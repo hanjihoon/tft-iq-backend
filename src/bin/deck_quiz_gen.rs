@@ -15,7 +15,7 @@
 //!
 //! 실행:  cargo run --bin deck_quiz_gen
  
-use std::collections::{HashSet};
+use std::collections::{HashMap, HashSet};
  
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
@@ -43,7 +43,8 @@ async fn main() -> anyhow::Result<()> {
  
     let meta = Meta::load_with_lang(set_number, "ko_kr", false).await?;
 
-    let carry_items: std::collections::HashMap<String, Vec<db::CarryItem>> = db::load_carry_top_items(&pool).await?;
+    let carry_items: HashMap<String, Vec<db::CarryTopItem>> =
+    db::load_carry_top_items(&pool).await?;
 
     // 임시: 표본별 덱 수 확인
     for threshold in [50i64, 100, 150, 200] {
@@ -116,7 +117,13 @@ async fn main() -> anyhow::Result<()> {
         let units_json: Vec<serde_json::Value> = deck.units.iter().map(|uid| {
             match carry_items.get(uid) {
                 Some(items) => serde_json::json!({
-                    "id": uid, "name": meta.unit_name(uid), "items": items,
+                    "id": uid,
+                    "name": meta.unit_name(uid),
+                    "items": items.iter().map(|it| serde_json::json!({
+                        "id": it.item_id,
+                        "name": it.name,
+                        "icon": it.icon,
+                    })).collect::<Vec<_>>(),
                 }),
                 None => serde_json::json!({
                     "id": uid, "name": meta.unit_name(uid),

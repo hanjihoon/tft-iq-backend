@@ -16,8 +16,8 @@ const PLAYERS_PER_CYCLE: i64 = 200;
 const MAX_PLAYERS_PER_TIER: usize = 500;
 /// 증분 조회 시 마지막 수집 시각에서 빼는 안전 마진(초). 막 끝난 게임 누락 방지.
 const CRAWL_MARGIN_SECS: i64 = 2 * 3600;
-/// 최대 몇개 매치를 저장할지
-const MAX_MATCHES: i64 = 20000;
+/// 솔로랭크 큐 ID. 더블업(1160)·노말(1090)·기타 모드 저장 차단 → 통계 오염 + 용량 12% 절감
+const SOLO_QUEUE_ID: i32 = 1100;
 
 /// 표본 수 → 수집 티어. (crawler_dev와 동일 정책)
 fn tiers_for_sample(match_count: i64) -> &'static [&'static str] {
@@ -28,6 +28,21 @@ fn tiers_for_sample(match_count: i64) -> &'static [&'static str] {
     } else {
         &["challenger", "grandmaster", "master"]
     }
+}
+
+/// 패치 버전 비교: "16.13" < "16.14" → true.
+/// 크롤 필터가 "target과 다르면 차단"이면 새 패치까지 막혀
+/// 표본이 영원히 안 쌓이는 데드락이 생긴다.
+/// → "target보다 오래된 것만 차단"으로 바꿔 새 패치는 병렬로 쌓이게 한다.
+fn patch_lt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> (u32, u32) {
+        let mut it = s.split('.');
+        (
+            it.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+            it.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+        )
+    };
+    parse(a) < parse(b)
 }
 
 #[tokio::main]
@@ -67,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     info!("이번 사이클 대상 {}명", players.len());
 
     let mut total_new = 0usize;
+    let mut total_skipped_queue = 0usize;
     let mut seen: HashSet<String> = HashSet::new();
 
     for puuid in &players {
@@ -76,36 +92,60 @@ async fn main() -> anyhow::Result<()> {
         let last = db::player_last_crawled_epoch(&pool, puuid).await.unwrap_or(None);
         let start_time = last.map(|t| t - CRAWL_MARGIN_SECS).or(patch_start);
 
-        match crawl_player(&riot, &pool, &cfg, puuid, start_time, target_patch.as_deref(), &mut seen).await {
-            Ok(n) => total_new += n,
-            Err(e) => warn!("플레이어 {puuid} 크롤 실패: {e}"),
-        }
-        if let Err(e) = db::mark_crawled(&pool, puuid).await {
-            warn!("mark_crawled 실패 {puuid}: {e}");
+        match crawl_player(
+            &riot, &pool, &cfg, puuid, start_time,
+            target_patch.as_deref(), &mut seen,
+        )
+        .await
+        {
+            Ok(stats) => {
+                total_new += stats.saved;
+                total_skipped_queue += stats.skipped_queue;
+                // ★ 성공했을 때만 last_crawled 전진.
+                //   실패 시에도 전진시키면 그 창의 매치가 영구 누락될 수 있다
+                //   (API 장애가 마진 2시간보다 길어지는 경우).
+                if let Err(e) = db::mark_crawled(&pool, puuid).await {
+                    warn!("mark_crawled 실패 {puuid}: {e}");
+                }
+            }
+            Err(e) => warn!("플레이어 {puuid} 크롤 실패 (다음 사이클 재시도): {e}"),
         }
     }
 
-    info!("크롤 완료. 신규 매치 {total_new}건 저장.");
+    info!("크롤 완료. 신규 {total_new}건 저장, 비솔로 {total_skipped_queue}건 스킵.");
     db::reconcile_patch_versions(&pool).await?;
 
-    // // 크롤러 사이클 끝, patch_versions 갱신 후
-    // let total = db::total_match_count(&pool).await?;
-    // if total > MAX_MATCHES {
-    //     match db::current_patch_info(&pool).await? {
-    //         Some(info) => {
-    //             let deleted = db::prune_matches(&pool, MAX_MATCHES, &info.patch).await?;
-    //             eprintln!("매치 정리: {} 삭제 → {} 유지 (현재 패치 {} 보존)",
-    //                 deleted, MAX_MATCHES, info.patch);
-    //         }
-    //         None => {
-    //             // 표본 임계 넘는 패치가 아직 없음 (예: 서비스 초기)
-    //             // → 현재 패치를 특정 못 하니, 안전하게 시간순으로만 정리
-    //             let deleted = db::prune_matches_by_time(&pool, MAX_MATCHES).await?;
-    //             eprintln!("매치 정리(시간순): {} 삭제 → {} 유지", deleted, MAX_MATCHES);
-    //         }
-    //     }
-    // }
+    // ── 4단계: 옛 패치 raw 정리 ─────────────────────────────
+    // target보다 오래된 패치의 raw만 삭제한다.
+    //   - target 자신은 patch_lt(t, t)=false 라 보존
+    //   - target보다 새로운(임계 미달로 아직 target 아닌) 패치도 보존
+    //   - 집계 테이블·퀴즈는 raw와 무관하게 남으므로 서빙에 영향 없음
+    // 이번에 수동으로 한 삭제를 자동화한 것. 세트/패치 전환 시 용량 재발 방지.
+    if let Some(tp) = target_patch.as_deref() {
+        if let Err(e) = prune_old_patches(&pool, tp).await {
+            warn!("옛 패치 정리 실패: {e}");
+        }
+    }
 
+    Ok(())
+}
+
+/// target_patch보다 오래된 패치의 raw 매치를 삭제.
+async fn prune_old_patches(pool: &sqlx::PgPool, target_patch: &str) -> anyhow::Result<()> {
+    let patches: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT patch FROM raw_matches")
+            .fetch_all(pool)
+            .await?;
+
+    for (p,) in patches {
+        if patch_lt(&p, target_patch) {
+            let res = sqlx::query("DELETE FROM raw_matches WHERE patch = $1")
+                .bind(&p)
+                .execute(pool)
+                .await?;
+            info!("옛 패치 {p} raw {}건 삭제 (target {target_patch} 미만)", res.rows_affected());
+        }
+    }
     Ok(())
 }
 
@@ -138,7 +178,13 @@ async fn refresh_top_players(
     Ok(())
 }
 
-/// 한 플레이어의 신규 매치를 증분으로 수집. 반환: 저장 건수.
+/// crawl_player의 결과 통계 (로그·모니터링용)
+struct CrawlStats {
+    saved: usize,
+    skipped_queue: usize,
+}
+
+/// 한 플레이어의 신규 매치를 증분으로 수집.
 async fn crawl_player(
     riot: &RiotClient,
     pool: &sqlx::PgPool,
@@ -147,7 +193,7 @@ async fn crawl_player(
     start_time: Option<i64>,
     target_patch: Option<&str>,
     seen: &mut HashSet<String>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<CrawlStats> {
     // start_time 이후 매치만 받음 (증분). None이면 전체.
     let match_ids = riot.match_ids_since(puuid, 100, start_time).await?;
 
@@ -158,7 +204,8 @@ async fn crawl_player(
         .filter(|id| !already.contains(id) && !seen.contains(id))
         .collect();
 
-    let mut new_count = 0;
+    let mut stats = CrawlStats { saved: 0, skipped_queue: 0 };
+
     for mid in new_ids {
         seen.insert(mid.clone());
         let m = match riot.match_detail(&mid).await {
@@ -169,16 +216,27 @@ async fn crawl_player(
             }
         };
 
-        // 안전망: 목표 패치만 저장 (경계에서 새는 지난 패치 차단)
+        // ★ 솔로랭크만 저장. 더블업·노말이 섞이면 통계가 오염되고
+        //   (실측 12%였음) 디스크도 낭비된다.
+        if m.info.queue_id != SOLO_QUEUE_ID {
+            stats.skipped_queue += 1;
+            continue;
+        }
+
+        // ★ 옛 패치만 차단, 새 패치는 통과.
+        //   (기존 `!=` 비교는 새 패치까지 막아 target 전환 데드락을 만들었다.
+        //    수동 삭제로 target이 None이 되며 우연히 풀렸던 그 문제.)
+        //   새 패치가 쌓여 표본 임계를 넘으면 current_patch_info가
+        //   자동으로 새 패치를 target으로 반환 → 무인 전환.
         if let Some(tp) = target_patch {
-            if m.info.patch() != tp {
+            if patch_lt(&m.info.patch(), tp) {
                 continue;
             }
         }
 
         if db::insert_raw_match(pool, &m, &cfg.riot_region).await? {
-            new_count += 1;
+            stats.saved += 1;
         }
     }
-    Ok(new_count)
+    Ok(stats)
 }

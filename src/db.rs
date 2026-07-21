@@ -1390,60 +1390,49 @@ pub async fn meta_decks(pool: &PgPool, patch: &str) -> Result<Vec<serde_json::Va
 
 use std::collections::HashMap;
 
-#[derive(Clone, serde::Serialize)]
-pub struct CarryItem {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CarryTopItem {
+    pub carry_id: String,
+    pub item_id: String,
     pub name: String,
     pub icon: String,
     pub avg: f64,
+    pub ord: i64,
 }
 
-/// 모든 캐리의 추천 아이템 top3를 한 번에 로드 → carry_id로 조회 가능한 맵
-pub async fn load_carry_top_items(pool: &PgPool) -> Result<HashMap<String, Vec<CarryItem>>> {
-    let rows: Vec<(String, String, Option<String>, f64)> = sqlx::query_as(
+pub async fn load_carry_top_items(
+    pool: &PgPool,
+) -> Result<HashMap<String, Vec<CarryTopItem>>> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, f64, i64)>(
         r#"
-        SELECT carry_id, t2.name, ic.icon_url AS icon, avg
-        FROM (
-            SELECT 
-                carry_id, name, avg,
-                -- [2단계] 피바/정손 승자와 나머지 아이템 전체를 두고 진짜 상위 3개를 뽑습니다.
-                ROW_NUMBER() OVER (
-                    PARTITION BY carry_id 
-                    ORDER BY avg ASC
-                ) AS final_rn
-            FROM (
-                SELECT
-                    p.prompt->'carry'->>'id' AS carry_id,
-                    s->>'name' AS name,
-                    MIN((s->>'avg_placement')::float8) AS avg,
-                    -- [1단계] 피바라기와 정의의 손길끼리만 내부 순위를 매깁니다.
-                    ROW_NUMBER() OVER (
-                        PARTITION BY p.prompt->'carry'->>'id',
-                                    CASE WHEN s->>'name' IN ('피바라기', '정의의 손길', '마법공학 총검') THEN '피바_정손_총검_그룹' ELSE s->>'name' END
-                        ORDER BY MIN((s->>'avg_placement')::float8) ASC
-                    ) AS inner_rn
-                FROM puzzles p, jsonb_array_elements(p.stats->'options') s
-                WHERE p.puzzle_type='item_combine' AND s->>'avg_placement' IS NOT NULL
-                GROUP BY p.prompt->'carry'->>'id', s->>'name'
-            ) t1
-            -- 피바라기와 정의의 손길 중 패자(inner_rn = 2)를 여기서 완벽히 탈락시킵니다.
-            -- 일반 아이템들은 그룹명이 다 달라 각각 inner_rn이 무조건 1이므로 무사히 통과합니다.
-            WHERE inner_rn = 1
-        ) t2
-        INNER JOIN item_classifications ic ON ic.name = t2.name
-        WHERE final_rn <= 3
-        ORDER BY carry_id, avg;
+        SELECT
+            p.prompt->'carry'->>'id'  AS carry_id,
+            item->>'id'               AS item_id,
+            item->>'name'             AS name,
+            item->>'icon'             AS icon,
+            (best_opt->>'avg_placement')::float8 AS avg,
+            ord::bigint               AS ord
+        FROM puzzles p,
+             LATERAL (
+                 SELECT s AS best_opt
+                 FROM jsonb_array_elements(p.stats->'options') s
+                 WHERE (s->>'is_best')::boolean = true
+                 LIMIT 1
+             ) b,
+             jsonb_array_elements(best_opt->'items') WITH ORDINALITY AS arr(item, ord)
+        WHERE p.puzzle_type = 'item_combine'
+          AND p.variant = 'main'
+        ORDER BY carry_id, ord
         "#,
     )
-    .fetch_all(pool)
-    .await?;
+    .fetch_all(pool).await?;
 
-    let mut map: HashMap<String, Vec<CarryItem>> = HashMap::new();
-    for (carry_id, name, icon, avg) in rows {
-        map.entry(carry_id).or_default().push(CarryItem {
-            name,
-            icon: icon.unwrap_or_default(), // icon 없으면 빈 문자열
-            avg,
-        });
+    // 캐리 id로 그룹핑
+    let mut map: HashMap<String, Vec<CarryTopItem>> = HashMap::new();
+    for (carry_id, item_id, name, icon, avg, ord) in rows {
+        map.entry(carry_id.clone())
+            .or_default()
+            .push(CarryTopItem { carry_id, item_id, name, icon, avg, ord });
     }
     Ok(map)
 }
@@ -1542,4 +1531,56 @@ pub async fn combo_stats_for_carry(
             tank_item_count: tank,
         })
         .collect())
+}
+
+pub struct SpecialRec {
+    pub item_id: String,
+    pub name: String,
+    pub icon_url: String,
+    pub avg_placement: f64,
+    pub picks: i64,
+}
+
+/// 캐리별 카테고리별 추천 (표본 하한 + 보정 상위 N)
+pub async fn special_recs_for_carry(
+    pool: &PgPool, set_number: i32, patch: &str,
+    carry_id: &str, category: &str, min_picks: i64, limit: i64,
+) -> Result<Vec<SpecialRec>> {
+    let rows = sqlx::query_as::<_, (String, String, String, f64, i64)>(
+        r#"
+        SELECT s.item_id, si.name, COALESCE(si.icon_url,''),
+               s.avg_placement::float8, s.pick_count
+        FROM special_item_stats s
+        JOIN special_items si ON si.item_id = s.item_id
+        WHERE s.set_number=$1 AND s.patch=$2 AND s.carry_id=$3
+          AND s.category=$4 AND s.pick_count >= $5
+        ORDER BY s.avg_placement ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(set_number).bind(patch).bind(carry_id).bind(category)
+    .bind(min_picks).bind(limit)
+    .fetch_all(pool).await?;
+
+    Ok(rows.into_iter().map(|(item_id, name, icon_url, avg, picks)| SpecialRec {
+        item_id, name, icon_url, avg_placement: avg, picks,
+    }).collect())
+}
+
+pub async fn carry_specials_list(
+    pool: &PgPool, set_number: i32, patch: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT carry_id
+        FROM special_item_stats
+        WHERE set_number = $1 AND patch = $2 AND pick_count >= 15
+        ORDER BY carry_id
+        "#,
+    )
+    .bind(set_number)
+    .bind(patch)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(c,)| c).collect())
 }

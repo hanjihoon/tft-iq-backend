@@ -8,7 +8,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
 
-const MIN_PATCH_MATCHES: i64 = 2000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
+const MIN_PATCH_MATCHES: i64 = 20000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
     let pool = PgPoolOptions::new()
@@ -1183,7 +1183,7 @@ pub async fn user_stats(pool: &PgPool, user_id: &str) -> Result<serde_json::Valu
         SELECT p.puzzle_type,
                COALESCE(
                  p.prompt->>'deck_label',
-                 p.prompt->'carry'->>'name'
+                 p.prompt->'carry'->>'id'
                ) AS grp,
                COUNT(*)::int8 AS total,
                COUNT(*) FILTER (WHERE a.correct)::int8 AS correct

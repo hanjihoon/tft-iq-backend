@@ -42,10 +42,19 @@ pub fn prettify(id: &str) -> String {
 /// derive를 쓰면 모든 필드를 자동으로 비교/해싱하므로 이 계약이 저절로 지켜진다.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompKey {
-    /// 정규화된(정렬된) 상위 특성들. 정렬해두면 순서가 달라도 같은 컴프로 취급된다.
     pub traits: Vec<String>,
-    /// 캐리 유닛의 character_id. 캐리가 없으면 None.
+    pub primary: Option<String>,
     pub carry: Option<String>,
+}
+
+impl CompKey {
+    /// 덱 라벨 (특성만). 캐리는 이미 키에 있으므로 제외한다.
+    /// 특성 id를 그대로 이어붙여 저장 — 프론트가 언어에 맞게 그린다.
+    pub fn trait_label(&self) -> String {
+        self.primary.as_ref()
+            .map(|t| format!("trait:{t}"))
+            .unwrap_or_default()
+    }
 }
 
 /// `Display`를 구현하면 `{}`로 출력할 수 있고, `.to_string()`도 공짜로 따라온다.
@@ -69,15 +78,16 @@ impl fmt::Display for CompKey {
 /// 함수가 `&Participant`(빌림)를 받는 데 주목. 소유권을 가져오지 않으므로
 /// 호출자는 여전히 자기 데이터를 자유롭게 쓸 수 있다. 분류는 "읽기"만 하면 되니까.
 pub fn classify(p: &Participant) -> CompKey {
+    let (traits, primary) = identity_traits(p);
     CompKey {
-        traits: identity_traits(p),
-        // TEST
+        traits,
+        primary,
         carry: find_carry(p),
     }
 }
 
 /// 컴프 정체성이 되는 상위 특성 추출.
-fn identity_traits(p: &Participant) -> Vec<String> {
+fn identity_traits(p: &Participant) -> (Vec<String>, Option<String>) {
     // iter()는 &Trait를 흘려주고, filter로 후보만 남긴 뒤 collect로 Vec<&Trait>를 만든다.
     // 여기서 모은 건 참조라서 복사 비용이 없다 (원본을 빌려 가리킬 뿐).
     let mut candidates: Vec<&Trait> = p
@@ -97,6 +107,9 @@ fn identity_traits(p: &Participant) -> Vec<String> {
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    // 정렬로 순서가 사라지기 전에 대표 특성을 확보한다.
+    let primary = candidates.first().map(|t| t.name.clone());   // 원본 id
+
     // 상위 2개만 취해 이름만 뽑는다.
     let mut traits: Vec<String> = candidates
         .iter()
@@ -105,10 +118,11 @@ fn identity_traits(p: &Participant) -> Vec<String> {
         .map(|t| prettify(&t.name))
         .collect();
 
+
     // ★ 정규화: 정렬해두면 ["Mecha","DarkStar"]와 ["DarkStar","Mecha"]가
     //   같은 Vec가 되어 같은 컴프로 집계된다.
     traits.sort();
-    traits
+    (traits, primary)
 }
 
 /// 캐리(아이템 최다 유닛) 식별.

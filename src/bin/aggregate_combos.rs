@@ -3,20 +3,28 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tft_iq::{Config, db};
+use tft_iq::comp::classify;
 
 const MIN_CARRY_RATE: f64 = 0.20;   // 3템 낀 비율 (캐리 판정)
 const MIN_TANK_ITEMS: i32 = 2;      // 탱커 판정 (tank 아이템 2+)
 const LOAD_LIMIT: i64 = 1_000_000;  // 전체 로드
 
+
+#[derive(Default)]
 struct ComboAgg {
     pick_count: i64,
     placement_sum: i64,
     tank_item_count: i32,
+    deck_counts: HashMap<String, i64>, 
 }
 
+#[derive(Default)]
 struct CarryAgg {
     total_appearances: i64,
     three_item_count: i64,
+    carry_boards: i64,
+    tier_sum: i64,
+    tier3_count: i64,
 }
 
 #[tokio::main]
@@ -69,37 +77,59 @@ async fn main() -> anyhow::Result<()> {
     for m in &matches {
         for p in &m.info.participants {
             let placement = p.placement as i64;
+
+            // 덱 판정은 참가자당 한 번. 유닛마다 부르면 8배 낭비다.
+            // 캐리는 이미 키에 있으므로 특성 조합만 라벨로 쓴다. 
+            let deck_key = classify(p).trait_label();
+
+            if combo_map.is_empty() { eprintln!("덱 라벨 예시: {deck_key}"); }
+
             for unit in &p.units {
                 let carry_id = &unit.character_id;
 
                 let carry = carry_map.entry(carry_id.clone())
-                    .or_insert(CarryAgg { total_appearances: 0, three_item_count: 0 });
+                    .or_insert_with(CarryAgg::default);
                 carry.total_appearances += 1;
 
-                // 정확히 3템
-                if unit.item_names.len() == 3 {
+                // 3템을 낀 유닛만 캐리로 본다
+                if unit.item_names.len() != 3 {
+                    continue;
+                }
 
-                    let all_craftable = unit.item_names.iter()
-                        .all(|i| craftable_items.contains(i));
-                    if !all_craftable {
-                        continue; // 특수템 낀 유닛은 스킵
-                    }
+                // 성급은 특수템 여부와 무관하게 센다.
+                // "이 유닛이 캐리일 때 3성으로 만드는가"가 질문이라,
+                // 유물·상징을 낀 캐리도 캐리다.
+                carry.carry_boards += 1;
+                carry.tier_sum += unit.tier as i64;
+                if unit.tier >= 3 {
+                    carry.tier3_count += 1;
+                }
 
-                    carry.three_item_count += 1;
+                // 조합 통계는 craftable만 — 유물/상징 낀 조합은
+                // 랜덤 획득이라 재현 불가능한 정답이 된다.
+                let all_craftable = unit.item_names.iter()
+                    .all(|i| craftable_items.contains(i));
+                if !all_craftable {
+                    continue;
+                }
 
-                    let mut items = unit.item_names.clone();
-                    items.sort();
-                    let combo = items.join(",");
+                carry.three_item_count += 1;
 
-                    let tank_count = items.iter()
-                        .filter(|i| tank_items.contains(*i)).count() as i32;
+                let mut items = unit.item_names.clone();
+                items.sort();
+                let combo = items.join(",");
 
-                    let agg = combo_map.entry((carry_id.clone(), combo))
-                        .or_insert(ComboAgg {
-                            pick_count: 0, placement_sum: 0, tank_item_count: tank_count,
-                        });
-                    agg.pick_count += 1;
-                    agg.placement_sum += placement;
+                let tank_count = items.iter()
+                    .filter(|i| tank_items.contains(*i)).count() as i32;
+
+                let agg = combo_map.entry((carry_id.clone(), combo))
+                    .or_insert_with(ComboAgg::default);
+                agg.pick_count += 1;
+                agg.placement_sum += placement;
+                agg.tank_item_count = tank_count;
+
+                if !deck_key.is_empty() {
+                    *agg.deck_counts.entry(deck_key.clone()).or_insert(0) += 1;
                 }
             }
         }
@@ -114,8 +144,11 @@ async fn main() -> anyhow::Result<()> {
             upsert_carry_stats(&pool, set_number, &patch, &carry_map).await?;
         }
         None => {
+            eprintln!("combo_stats 저장 시작");
             save_combo_stats(&pool, set_number, &patch, &combo_map).await?;
+            eprintln!("combo_stats 저장 완료");
             save_carry_stats(&pool, set_number, &patch, &carry_map, &combo_map, &tank_items).await?;
+            eprintln!("carry_stats 저장 완료");
         }
     }
 
@@ -137,19 +170,35 @@ async fn save_combo_stats(
 
     for chunk in entries.chunks(BATCH) {
         let mut qb = sqlx::QueryBuilder::new(
-            "INSERT INTO item_combo_stats (set_number, patch, carry_id, item_combo, pick_count, placement_sum, avg_placement, tank_item_count) "
+            "INSERT INTO item_combo_stats (set_number, patch, carry_id, item_combo, pick_count, placement_sum, avg_placement, tank_item_count, top_deck, top_deck_ratio) "
         );
         qb.push_values(chunk, |mut b, ((carry_id, combo), agg)| {
             let avg = agg.placement_sum as f64 / agg.pick_count as f64;
+            let (top_deck, ratio) = top_deck_of(agg);
             b.push_bind(set_number)
-             .push_bind(patch)
-             .push_bind(carry_id)
-             .push_bind(combo)
-             .push_bind(agg.pick_count)
-             .push_bind(agg.placement_sum)
-             .push_bind(avg as f32)
-             .push_bind(agg.tank_item_count);
+            .push_bind(patch)
+            .push_bind(carry_id)
+            .push_bind(combo)
+            .push_bind(agg.pick_count)
+            .push_bind(agg.placement_sum)
+            .push_bind(avg as f32)
+            .push_bind(agg.tank_item_count)
+            .push_bind(top_deck)          // Option<String> → NULL 가능
+            .push_bind(ratio);
         });
+        qb.push(
+            r#" ON CONFLICT (set_number, patch, carry_id, item_combo)
+                DO UPDATE SET
+                    pick_count = item_combo_stats.pick_count + EXCLUDED.pick_count,
+                    placement_sum = item_combo_stats.placement_sum + EXCLUDED.placement_sum,
+                    avg_placement = (item_combo_stats.placement_sum + EXCLUDED.placement_sum)::real
+                                    / (item_combo_stats.pick_count + EXCLUDED.pick_count),
+                    tank_item_count = EXCLUDED.tank_item_count
+                    -- top_deck, top_deck_ratio 는 갱신하지 않는다.
+                    -- 이 배치만의 부분 표본으로 계산된 값이라, 누적된 전체 분포를
+                    -- 대표하지 못한다. 전체 재집계 때만 갱신된다.
+            "#
+        );
         qb.build().execute(pool).await?;
     }
     Ok(())
@@ -181,13 +230,16 @@ async fn save_carry_stats(
         sqlx::query(
             r#"
             INSERT INTO carry_stats
-                (set_number, patch, carry_id, total_appearances, three_item_count, three_item_rate, is_carry, is_tank)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (set_number, patch, carry_id, total_appearances, three_item_count, three_item_rate, is_carry, is_tank, tier_sum, tier3_count, carry_boards)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(set_number).bind(patch).bind(carry_id)
         .bind(agg.total_appearances).bind(agg.three_item_count)
         .bind(rate as f32).bind(is_carry).bind(is_tank)
+        .bind(agg.tier_sum)
+        .bind(agg.tier3_count)
+        .bind(agg.carry_boards)
         .execute(pool).await?;
     }
     Ok(())
@@ -216,10 +268,9 @@ async fn upsert_carry_stats(
     for chunk in entries.chunks(BATCH) {
         let mut qb = sqlx::QueryBuilder::new(
             "INSERT INTO carry_stats \
-             (set_number, patch, carry_id, total_appearances, three_item_count, three_item_rate, is_carry, is_tank) ",
+            (set_number, patch, carry_id, total_appearances, three_item_count, three_item_rate, is_carry, is_tank, tier_sum, tier3_count, carry_boards) ",
         );
         qb.push_values(chunk, |mut b, (carry_id, agg)| {
-            // 신규 삽입 시 임시 rate (아래서 어차피 재계산됨)
             let tmp_rate = if agg.total_appearances > 0 {
                 agg.three_item_count as f32 / agg.total_appearances as f32
             } else {
@@ -231,15 +282,23 @@ async fn upsert_carry_stats(
                 .push_bind(agg.total_appearances)
                 .push_bind(agg.three_item_count)
                 .push_bind(tmp_rate)
-                .push_bind(false) // is_carry 임시
-                .push_bind(false); // is_tank 임시
+                .push_bind(false)              // is_carry 임시
+                .push_bind(false)              // is_tank 임시
+                .push_bind(agg.tier_sum)
+                .push_bind(agg.tier3_count)
+                .push_bind(agg.carry_boards);
         });
         qb.push(
             " ON CONFLICT (set_number, patch, carry_id) DO UPDATE SET \
-             total_appearances = carry_stats.total_appearances + EXCLUDED.total_appearances, \
-             three_item_count  = carry_stats.three_item_count  + EXCLUDED.three_item_count",
+            total_appearances = carry_stats.total_appearances + EXCLUDED.total_appearances, \
+            three_item_count  = carry_stats.three_item_count  + EXCLUDED.three_item_count, \
+            tier_sum          = carry_stats.tier_sum          + EXCLUDED.tier_sum, \
+            tier3_count       = carry_stats.tier3_count       + EXCLUDED.tier3_count, \
+            carry_boards      = carry_stats.carry_boards      + EXCLUDED.carry_boards"
         );
+        eprintln!("upsert_carry_stats 생성된 SQL3:\n{}", qb.sql());
         qb.build().execute(&mut *tx).await?;
+        
     }
 
     // ── 2. rate, is_carry 재계산 (누적된 값 기준, 통째로) ──
@@ -257,16 +316,16 @@ async fn upsert_carry_stats(
 
     // ── 3. is_tank 재계산: 각 캐리의 픽률1위 조합의 tank_item_count >= 2 ──
     sqlx::query(
-        "UPDATE carry_stats cs SET is_tank = COALESCE(( \
+        "UPDATE carry_stats SET is_tank = COALESCE(( \
              SELECT ics.tank_item_count >= $3 \
              FROM item_combo_stats ics \
-             WHERE ics.set_number = cs.set_number \
-               AND ics.patch = cs.patch \
-               AND ics.carry_id = cs.carry_id \
+             WHERE ics.set_number = carry_stats.set_number \
+               AND ics.patch = carry_stats.patch \
+               AND ics.carry_id = carry_stats.carry_id \
              ORDER BY ics.pick_count DESC \
              LIMIT 1 \
          ), false) \
-         WHERE cs.set_number = $1 AND cs.patch = $2",
+         WHERE carry_stats.set_number = $1 AND carry_stats.patch = $2",
     )
     .bind(set_number)
     .bind(patch)
@@ -315,36 +374,7 @@ async fn upsert_combo_stats(
     Ok(())
 }
 
-pub struct ComboStat {
-    pub item_combo: String,      // "TFT_Item_A,B,C"
-    pub picks: i64,
-    pub avg_placement: f64,
-    pub tank_item_count: i32,
-}
 
-pub async fn combo_stats_for_carry(
-    pool: &PgPool,
-    set_number: i32,
-    patch: &str,
-    carry_id: &str,
-    min_picks: i64,
-) -> anyhow::Result<Vec<ComboStat>> {
-    let rows = sqlx::query_as::<_, (String, i64, f64, i32)>(
-        r#"
-        SELECT item_combo, pick_count, avg_placement, tank_item_count
-        FROM item_combo_stats
-        WHERE set_number = $1 AND patch = $2 AND carry_id = $3
-          AND pick_count >= $4
-        ORDER BY pick_count DESC
-        "#,
-    )
-    .bind(set_number).bind(patch).bind(carry_id).bind(min_picks)
-    .fetch_all(pool).await?;
-
-    Ok(rows.into_iter().map(|(combo, picks, avg, tank)| ComboStat {
-        item_combo: combo, picks, avg_placement: avg, tank_item_count: tank,
-    }).collect())
-}
 
 pub struct CarryInfo {
     pub carry_id: String,
@@ -374,4 +404,20 @@ pub async fn carry_list_for_combo(
     Ok(rows.into_iter().map(|(id, app, tank)| CarryInfo {
         carry_id: id, total_appearances: app, is_tank: tank,
     }).collect())
+}
+
+/// 덱 카운트에서 1위와 비율을 뽑는다.
+/// 비율이 낮으면(여러 덱에 두루 쓰이면) 특정 덱을 지목하는 게 오히려 오해를 부르므로 버린다.
+fn top_deck_of(agg: &ComboAgg) -> (Option<String>, f32) {
+    const MIN_RATIO: f32 = 0.40;
+
+    let Some((deck, n)) = agg.deck_counts.iter().max_by_key(|(_, n)| **n) else {
+        return (None, 0.0);
+    };
+    let ratio = *n as f32 / agg.pick_count.max(1) as f32;
+    if ratio < MIN_RATIO {
+        (None, ratio)   // 범용 빌드 — 지목하지 않는다
+    } else {
+        (Some(deck.clone()), ratio)
+    }
 }

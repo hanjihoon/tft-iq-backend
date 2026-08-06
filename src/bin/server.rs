@@ -241,16 +241,32 @@ async fn answer_quiz(
     Ok(Json(AttemptResp { correct, answer, stats }))
 }
 
+#[derive(serde::Deserialize)]
+struct NextQuery {
+    r#type: Option<String>,
+    mode: Option<String>,
+    group: Option<String>,
+}
+
 /// 안 푼 퀴즈 하나. 헤더 X-User-Id로 익명 유저 식별.
 async fn next_unsolved(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<NextQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user_id = headers.get("X-User-Id").and_then(|v| v.to_str().ok()).unwrap_or("anon");
-    // ?type=item_combine | deck_complete, 기본은 item_combine
-    let ptype = q.get("type").map(|s| s.as_str()).unwrap_or("item_combine");
-    let mode = q.get("mode").map(|s| s.as_str()).unwrap_or("normal");
+    let user_id = headers.get("X-User-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anon");
+
+    // ?type=item_combine | deck_complete | trait_quiz, 기본은 item_combine
+    let ptype = q.r#type.as_deref().unwrap_or("item_combine");
+    let mode  = q.mode.as_deref().unwrap_or("normal");
+    // 약점에서 진입한 경우에만 값이 있다. 타입에 따라 carry_id이거나 deck_label이라
+    // 서버는 의미를 해석하지 않고 그대로 매칭에만 쓴다.
+    let group = q.group.as_deref();
+    
+    tracing::info!("next_quiz: type={ptype}, mode={mode}, group={group:?}, user={user_id}");
+
 
 
     let current_patch = match db::current_patch_info(&st.pool).await? {
@@ -262,7 +278,7 @@ async fn next_unsolved(
     };
 
     let puzzle = if mode == "review" {
-        db::review_puzzle(&st.pool, user_id, ptype, &current_patch).await?
+        db::review_puzzle(&st.pool, user_id, ptype, &current_patch, group).await?
     } else {
         db::unsolved_puzzle_by_type(&st.pool, user_id, ptype, &current_patch).await?
     };
@@ -297,7 +313,6 @@ async fn meta_info_handler(State(st): State<AppState>) -> Result<Json<serde_json
     })))
 }
 
-// server.rs에 새 라우트 핸들러
 async fn review_counts(
     State(st): State<AppState>, headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -306,7 +321,6 @@ async fn review_counts(
     let deck = db::review_count(&st.pool, user_id, "deck_complete").await?;
     Ok(Json(serde_json::json!({ "item_combine": item, "deck_complete": deck })))
 }
-// 라우트 등록: .route("/api/quiz/review/count", get(review_counts))
 
 async fn user_stats_handler(
     State(st): State<AppState>, headers: HeaderMap,

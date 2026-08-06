@@ -1,6 +1,6 @@
-# Fly.io 배포 설정 — 웹(app) + 백그라운드 워커(worker) 2개 프로세스
-app = "tft-iq-backend"          # ← 본인 앱 이름으로 (충돌 시 변경)
-primary_region = "nrt"          # 도쿄
+# Fly.io deploy config: app (API) + worker (scheduler)
+app = "tft-iq-backend"
+primary_region = "nrt"
 
 [build]
   dockerfile = "Dockerfile"
@@ -10,14 +10,14 @@ primary_region = "nrt"          # 도쿄
   RIOT_PLATFORM = "kr"
   RIOT_REGION = "asia"
   BIND_ADDR = "0.0.0.0:8080"
-  SCHED_INTERVAL_SECS = "172800"  # 48시간마다
+  SCHED_INTERVAL_SECS = "21600"  # 6 hours
 
-# 프로세스 2개: app = API 서버, worker = 스케줄러
+# app = API server, worker = scheduler
 [processes]
   app = "/app/server"
   worker = "/app/scheduler"
 
-# HTTP는 app 프로세스에만 연결
+# HTTP service (app process only)
 [http_service]
   internal_port = 8080
   force_https = true

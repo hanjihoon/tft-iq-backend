@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         if !uid.starts_with(&format!("TFT{}_", set_number))
             || uid.contains("Summon")
             || uid.contains("Minion")
+            || uid.contains("follower")
         {
             continue;
         }

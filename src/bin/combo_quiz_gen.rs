@@ -75,13 +75,24 @@ async fn make_and_insert(
     let options: Vec<serde_json::Value> = candidates
         .iter()
         .map(|c| {
-            serde_json::json!({
+            let is_best = c.item_combo == answer.item_combo;
+            let mut o = serde_json::json!({
                 "combo": c.item_combo,
                 "items": build_combo_items(&c.item_combo, item_map),
                 "avg_placement": (c.avg_placement * 100.0).round() / 100.0,
                 "picks": c.picks,
-                "is_best": c.item_combo == answer.item_combo,
-            })
+                "is_best": is_best,
+            });
+
+            // 최빈덱은 정답에만 싣는다. 오답의 주력 덱은 화면에서 쓰지 않는다.
+            // 비율이 낮아 집계에서 NULL로 걸러진 조합(범용 빌드)은 그대로 생략된다.
+            if is_best {
+                if let Some(td) = &c.top_deck {
+                    o["top_deck"] = serde_json::json!(td);
+                    o["top_deck_ratio"] = serde_json::json!((c.top_deck_ratio * 100.0).round() as i32);
+                }
+            }
+            o
         })
         .collect();
 

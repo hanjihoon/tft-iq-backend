@@ -398,6 +398,7 @@ pub async fn current_patch_info(pool: &PgPool) -> Result<Option<PatchInfo>> {
                match_count
         FROM patch_versions
         WHERE match_count >= $1
+        AND EXISTS (SELECT 1 FROM puzzles WHERE puzzles.patch = patch_versions.patch)
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
@@ -588,15 +589,12 @@ pub async fn current_patch_match_count(pool: &PgPool) -> Result<i64> {
         r#"
         SELECT match_count::int8
         FROM patch_versions
-        WHERE match_count >= $1
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
     )
-    .bind(MIN_PATCH_MATCHES)
     .fetch_optional(pool)
     .await?;
-    // 패치 데이터가 아직 없으면 0
     Ok(row.map(|(c,)| c).unwrap_or(0))
 }
 
@@ -832,9 +830,13 @@ pub struct MetaInfo {
 
 pub async fn meta_info(pool: &PgPool) -> Result<MetaInfo> {
     let (patch, total): (String, i64) = sqlx::query_as(
-        r#"SELECT patch, match_count::int8 FROM patch_versions
-           ORDER BY earliest_game_datetime DESC NULLS LAST LIMIT 1"#,
+        r#"SELECT patch, match_count::int8
+                FROM patch_versions
+                WHERE match_count >= $1
+                ORDER BY earliest_game_datetime DESC NULLS LAST
+                LIMIT 1"#,
     )
+    .bind(MIN_PATCH_MATCHES)
     .fetch_optional(pool)
     .await?
     .unwrap_or_else(|| ("?".into(), 0));
@@ -878,12 +880,14 @@ pub async fn raw_decks(
                   FROM jsonb_array_elements(p->'units') u
                   WHERE u->>'character_id' LIKE 'TFT17_%'
                     AND u->>'character_id' NOT LIKE '%Summon%'
-                    AND u->>'character_id' NOT LIKE '%Minion%') AS deck,
+                    AND u->>'character_id' NOT LIKE '%Minion%'
+                    AND u->>'character_id' NOT LIKE '%follower%') AS deck,
                  (SELECT COUNT(DISTINCT u->>'character_id')
                   FROM jsonb_array_elements(p->'units') u
                   WHERE u->>'character_id' LIKE 'TFT17_%'
                     AND u->>'character_id' NOT LIKE '%Summon%'
-                    AND u->>'character_id' NOT LIKE '%Minion%') AS unit_count
+                    AND u->>'character_id' NOT LIKE '%Minion%'
+                    AND u->>'character_id' NOT LIKE '%follower%') AS unit_count
           FROM raw_matches m,
                jsonb_array_elements(m.raw->'info'->'participants') AS p
           WHERE m.patch = $1
@@ -1110,30 +1114,28 @@ pub async fn review_puzzle(
     user_id: &str,
     puzzle_type: &str,
     patch: &str,
+    group: Option<&str>,
 ) -> Result<Option<PuzzleRow>> {
-    let row: Option<PuzzleRow> = sqlx::query_as(
+    let row = sqlx::query_as(
         r#"
-        SELECT p.id, p.puzzle_type, p.patch, p.set_number, p.prompt, p.options, p.stats
+        SELECT p.*
         FROM puzzles p
-        WHERE p.puzzle_type = $2
-        AND p.patch = $3 
-          AND EXISTS (
-            -- 이 퍼즐의 가장 최근 시도가 '틀림'인 경우
-            SELECT 1 FROM puzzle_attempts a
-            WHERE a.user_id = $1 AND a.puzzle_id = p.id
-              AND a.correct = false
-              AND a.created_at = (
-                SELECT MAX(a2.created_at) FROM puzzle_attempts a2
-                WHERE a2.user_id = $1 AND a2.puzzle_id = p.id
-              )
-          )
-        ORDER BY random()
+        JOIN puzzle_attempts a ON a.puzzle_id = p.id
+        WHERE a.user_id = $1
+          AND p.patch = $3
+          AND a.correct = false
+        ORDER BY
+          -- group이 주어지면 그것부터 (일치=true가 먼저)
+          ($4::text IS NOT NULL
+           AND COALESCE(p.prompt->>'deck_label', p.prompt->'carry'->>'id') = $4) DESC,
+          random()          -- 기존 정렬 방식으로 교체
         LIMIT 1
         "#,
     )
     .bind(user_id)
     .bind(puzzle_type)
     .bind(patch)
+    .bind(group)
     .fetch_optional(pool)
     .await?;
     Ok(row)
@@ -1494,10 +1496,12 @@ pub async fn carry_list_for_combo(
 /// 캐리의 3템 조합 통계 (픽률 순, min_picks 이상)
 #[derive(Debug, Clone)]
 pub struct ComboStat {
-    pub item_combo: String, // "TFT_Item_A,TFT_Item_B,TFT_Item_C"
+    pub item_combo: String,      // "TFT_Item_A,B,C"
     pub picks: i64,
     pub avg_placement: f64,
     pub tank_item_count: i32,
+    pub top_deck: Option<String>,
+    pub top_deck_ratio: f32,
 }
 
 pub async fn combo_stats_for_carry(
@@ -1506,29 +1510,32 @@ pub async fn combo_stats_for_carry(
     patch: &str,
     carry_id: &str,
     min_picks: i64,
-) -> Result<Vec<ComboStat>> {
-    let rows = sqlx::query_as::<_, (String, i64, f32, i32)>(
+) -> anyhow::Result<Vec<ComboStat>> {
+    let rows = sqlx::query_as::<_, (String, i64, f64, i32, Option<String>, f32)>(
         r#"
-        SELECT item_combo, pick_count, avg_placement, tank_item_count
+        SELECT item_combo,
+               pick_count,
+               avg_placement::float8,
+               tank_item_count,
+               top_deck,
+               COALESCE(top_deck_ratio, 0)
         FROM item_combo_stats
         WHERE set_number = $1 AND patch = $2 AND carry_id = $3
           AND pick_count >= $4
         ORDER BY pick_count DESC
         "#,
     )
-    .bind(set_number)
-    .bind(patch)
-    .bind(carry_id)
-    .bind(min_picks)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(item_combo, picks, avg, tank)| ComboStat {
-            item_combo,
+    .bind(set_number).bind(patch).bind(carry_id).bind(min_picks)
+    .fetch_all(pool).await?;
+
+    Ok(rows.into_iter()
+        .map(|(combo, picks, avg, tank, top_deck, ratio)| ComboStat {
+            item_combo: combo,
             picks,
-            avg_placement: avg as f64,
+            avg_placement: avg,
             tank_item_count: tank,
+            top_deck,
+            top_deck_ratio: ratio,
         })
         .collect())
 }
@@ -1583,4 +1590,114 @@ pub async fn carry_specials_list(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// 덱별·유닛별 3성 비율 (0~100).
+/// 리롤덱의 핵심 유닛을 가려내기 위한 신호.
+/// deck_key는 raw_decks와 동일하게 "보드 유닛 id 정렬 후 콤마 결합"이어야 한다.
+/// 유닛별 3성 비율 (0~100). 리롤 유닛인지 판별용.
+pub async fn load_unit_star3(pool: &PgPool, set_number: i32, patch: &str)
+    -> Result<HashMap<String, i32>>
+{
+    let rows: Vec<(String, i32)> = sqlx::query_as(
+        r#"
+        SELECT carry_id,
+               ROUND(100.0 * tier3_count / NULLIF(carry_boards, 0))::int
+        FROM carry_stats
+        WHERE set_number = $1 AND patch = $2
+        AND carry_boards >= 50
+        AND carry_id LIKE 'TFT17!_%' ESCAPE '!'
+        AND carry_id NOT ILIKE '%summon%'
+        AND carry_id NOT ILIKE '%minion%'
+        AND carry_id NOT ILIKE '%follower%'
+        "#,
+    ).bind(set_number).bind(patch).fetch_all(pool).await?;
+    Ok(rows.into_iter().collect())
+}
+
+pub struct DeckStatRow {
+    pub deck_key: String,
+    pub units: serde_json::Value,
+    pub label: String,
+    pub avg_placement: f64,
+    pub games: i64,
+}
+
+pub async fn upsert_deck_stats_batch(
+    pool: &PgPool, patch: &str, set_number: i32, rows: &[DeckStatRow],
+) -> Result<()> {
+    const BATCH: usize = 500;
+    for chunk in rows.chunks(BATCH) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO deck_stats (deck_key, patch, set_number, units, trait_label, avg_placement, games, updated_at) "
+        );
+        qb.push_values(chunk, |mut b, r| {
+            b.push_bind(&r.deck_key)
+             .push_bind(patch)
+             .push_bind(set_number)
+             .push_bind(&r.units)
+             .push_bind(&r.label)
+             .push_bind(r.avg_placement as f32)
+             .push_bind(r.games as i32)
+             .push_bind(chrono::Utc::now());
+        });
+        qb.push(
+            " ON CONFLICT (deck_key, patch) DO UPDATE SET \
+              units = EXCLUDED.units, \
+              trait_label = EXCLUDED.trait_label, \
+              avg_placement = EXCLUDED.avg_placement, \
+              games = EXCLUDED.games, \
+              updated_at = EXCLUDED.updated_at"
+        );
+        qb.build().execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub struct DeckPuzzleRow {
+    /// puzzles.carry_id 에 저장된다 (덱 퀴즈에선 덱 식별자로 쓰임)
+    pub carry_id: String,
+    pub variant: String,
+    pub prompt: serde_json::Value,
+    pub options: serde_json::Value,
+    pub answer: String,
+    pub stats: serde_json::Value,
+}
+
+pub async fn insert_deck_puzzles_batch(
+    pool: &PgPool, set_number: i32, patch: &str, rows: &[DeckPuzzleRow],
+) -> Result<()> {
+    const BATCH: usize = 500;
+    for chunk in rows.chunks(BATCH) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO puzzles \
+             (puzzle_type, set_number, patch, carry_id, variant, carry_type, \
+              prompt, options, answer, stats, source_match_id) "
+        );
+        qb.push_values(chunk, |mut b, r| {
+            b.push_bind("deck_complete")
+             .push_bind(set_number)
+             .push_bind(patch)
+             .push_bind(&r.carry_id)
+             .push_bind(&r.variant)
+             .push_bind("deck")
+             .push_bind(&r.prompt)
+             .push_bind(&r.options)
+             .push_bind(&r.answer)
+             .push_bind(&r.stats)
+             .push_bind(Option::<String>::None);   // source_match_id
+        });
+        qb.push(
+            " ON CONFLICT (puzzle_type, carry_id, patch, variant) WHERE carry_id IS NOT NULL \
+              DO UPDATE SET \
+                prompt     = EXCLUDED.prompt, \
+                options    = EXCLUDED.options, \
+                answer     = EXCLUDED.answer, \
+                stats      = EXCLUDED.stats, \
+                set_number = EXCLUDED.set_number, \
+                updated_at = now()"
+        );
+        qb.build().execute(pool).await?;
+    }
+    Ok(())
 }

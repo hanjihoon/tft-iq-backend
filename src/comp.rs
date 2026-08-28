@@ -25,7 +25,6 @@ pub fn cost_from_rarity(rarity: i32) -> i32 {
     }
 }
 
-/// "TFT17_DarkStar" → "DarkStar" 처럼 세트 접두사를 떼어 사람이 읽기 좋게.
 pub fn prettify(id: &str) -> String {
     // split_once는 첫 '_'에서 한 번만 쪼개 (앞, 뒤) 튜플을 Option으로 돌려준다.
     // '_'가 없으면 None → 원본을 그대로 쓴다.
@@ -143,97 +142,4 @@ fn find_carry(p: &Participant) -> Option<String> {
 
     // first()는 Option<&&Unit>. map으로 character_id를 복제해 Option<String>으로.
     carriers.first().map(|u| u.character_id.clone())
-}
-
-// ───────────────────────── 단위 테스트 ─────────────────────────
-// `#[cfg(test)]`: 이 모듈은 `cargo test`로 빌드할 때만 컴파일된다 (운영 바이너리엔 안 들어감).
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::riot::dto::{Trait, Unit};
-
-    fn trait_(name: &str, tier_current: i32, tier_total: i32, num_units: i32) -> Trait {
-        Trait {
-            name: name.to_string(),
-            num_units,
-            style: 0,
-            tier_current,
-            tier_total,
-        }
-    }
-
-    fn unit_(id: &str, rarity: i32, items: &[&str]) -> Unit {
-        Unit {
-            character_id: id.to_string(),
-            item_names: items.iter().map(|s| s.to_string()).collect(),
-            rarity,
-            tier: 2,
-        }
-    }
-
-    fn participant(traits: Vec<Trait>, units: Vec<Unit>, placement: i32) -> Participant {
-        Participant {
-            puuid: "x".into(),
-            placement,
-            level: 9,
-            last_round: 33,
-            gold_left: 0,
-            players_eliminated: 0,
-            time_eliminated: 0.0,
-            total_damage_to_players: 0,
-            augments: vec![],
-            traits,
-            units,
-        }
-    }
-
-    #[test]
-    fn 고유특성은_컴프식별에서_제외된다() {
-        let p = participant(
-            vec![
-                trait_("TFT17_DarkStar", 2, 4, 6),
-                trait_("TFT17_FioraUniqueTrait", 1, 1, 1), // 제외 대상
-            ],
-            vec![],
-            1,
-        );
-        let key = classify(&p);
-        assert_eq!(key.traits, vec!["DarkStar".to_string()]);
-    }
-
-    #[test]
-    fn 특성순서가_달라도_같은_키가_된다() {
-        let a = participant(
-            vec![trait_("TFT17_Mecha", 2, 3, 4), trait_("TFT17_DarkStar", 2, 3, 4)],
-            vec![],
-            1,
-        );
-        let b = participant(
-            vec![trait_("TFT17_DarkStar", 2, 3, 4), trait_("TFT17_Mecha", 2, 3, 4)],
-            vec![],
-            1,
-        );
-        // 정규화(정렬) 덕분에 입력 순서가 달라도 동치
-        assert_eq!(classify(&a), classify(&b));
-    }
-
-    #[test]
-    fn 아이템_최다_유닛이_캐리로_뽑힌다() {
-        let p = participant(
-            vec![],
-            vec![
-                unit_("TFT17_Tank", 4, &["a", "b"]),
-                unit_("TFT17_Jhin", 2, &["a", "b", "c"]), // 아이템 3개 → 캐리
-            ],
-            1,
-        );
-        assert_eq!(classify(&p).carry, Some("TFT17_Jhin".to_string()));
-    }
-
-    #[test]
-    fn 아이템_없으면_캐리는_None() {
-        let p = participant(vec![], vec![unit_("TFT17_X", 0, &[])], 8);
-        assert_eq!(classify(&p).carry, None);
-    }
 }

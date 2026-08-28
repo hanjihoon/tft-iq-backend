@@ -78,13 +78,13 @@ async fn main() -> anyhow::Result<()> {
         answer_apis.sort();
         let trait_apis: Vec<String> = normalize_traits(&answer_apis);
 
-        let answer = trait_apis.join(",");  // "TFT17_Sniper,TFT17_XXX"
+        let answer = trait_apis.join(","); 
 
         // ... prompt, stats 만들기 (기존) ...
 
         db::insert_trait_puzzle(
             &pool, "trait_quiz", &patch, set_number, uid,
-            &normalize_trait(&answer),
+            &answer,
             &prompt, &stats,
         )
         .await?;
@@ -98,7 +98,6 @@ async fn main() -> anyhow::Result<()> {
 fn unit_icon(id: &str, set: i32) -> String {
     let low = id.to_lowercase();
     let file_base: &str = match low.as_str() {
-        "tft17_rhaast" => "tft17_kayn_slay",
         other => other,
     };
     format!(
@@ -106,22 +105,13 @@ fn unit_icon(id: &str, set: i32) -> String {
     )
 }
 
-fn normalize_trait(api: &str) -> String {
-    // 별돌보미 변종 통합: TFT17_Stargazer_XXX → TFT17_Stargazer
-    if api.starts_with("TFT17_Stargazer_") {
-        return "TFT17_Stargazer".to_string();
-    }
-    api.to_string()
-}
-
 fn normalize_traits(traits: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for t in traits {
-        let normalized = normalize_trait(t);
         // 중복 아니면 추가 (순서 유지)
-        if seen.insert(normalized.clone()) {
-            result.push(normalized);
+        if seen.insert(t.clone()) {
+            result.push(t.to_string());
         }
     }
     result

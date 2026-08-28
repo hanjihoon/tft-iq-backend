@@ -6,7 +6,7 @@ const CDRAGON_KO: &str = "https://raw.communitydragon.org/latest/cdragon/tft/ko_
 fn special_category(api: &str) -> Option<&'static str> {
     if api.contains("_Artifact_") {
         Some("artifact")
-    } else if api.ends_with("EmblemItem") {
+    } else if api.contains("Emblem") {
         Some("emblem")
     } else {
         None

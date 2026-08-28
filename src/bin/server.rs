@@ -24,6 +24,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
+use tft_iq::meta::unit_icon;
 
 #[derive(Clone)]
 struct AppState {
@@ -360,29 +361,34 @@ async fn meta_decks_handler(
 
 async fn meta_units_handler(
     Query(q): Query<MetaQuery>,
-    State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    State(st): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let patch = match db::current_patch_info(&st.pool).await? {
         Some(info) => info,
         None => return Ok(Json(serde_json::json!({}))),
     };
-    let lang = q.lang.unwrap_or_else(|| "ko_kr".into());
-    // 언어 화이트리스트 (안전 — 아무 문자열이나 URL에 넣으면 위험)
-    let lang = validate_lang(&lang);
+    let lang = validate_lang(&q.lang.unwrap_or_else(|| "ko_kr".into()));
     let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
 
-    let info: serde_json::Map<String, serde_json::Value> = meta.units.iter()
-        .map(|(id, u)| {
-            (id.clone(), serde_json::json!({
-                "name": u.name, 
-                "cost": u.cost,
-                "traits": u.traits,
-                "ability": u.ability,  // SkillMeta (Serialize)
-            }))
-        })
-        .collect();
+    // cdragon이 아직 Set 18 유닛을 채우지 않아 meta.units가 부실하다.
+    // 매치에 실제로 등장한 유닛을 기준으로 삼고, 이름·특성은 meta에서
+    // 있으면 채우고 없으면 id를 그대로 쓴다.
+    let costs = db::unit_costs_from_matches(&st.pool, patch.set_number).await?;
+
+    let mut info = serde_json::Map::new();
+    for (id, cost) in &costs {
+        let m = meta.units.get(id);
+        info.insert(id.clone(), serde_json::json!({
+            "name":   m.map(|u| u.name.clone()).unwrap_or_else(|| id.clone()),
+            "cost":   m.map(|u| u.cost).unwrap_or(*cost),
+            "traits": m.map(|u| u.traits.clone()).unwrap_or_default(),
+            "ability": m.map(|u| serde_json::json!(u.ability)).unwrap_or(serde_json::Value::Null),
+            "icon":   unit_icon(id),
+        }));
+    }
 
     Ok(Json(serde_json::Value::Object(info)))
-} 
+}
 
 async fn meta_traits_handler(
     Query(q): Query<MetaQuery>,

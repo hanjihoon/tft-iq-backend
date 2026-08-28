@@ -12,7 +12,7 @@ pub struct Meta {
     pub augments: HashMap<String, String>,
     pub units: HashMap<String, UnitMeta>,
     pub items: HashMap<String, String>,
-    pub traits: HashMap<String, String>,   // apiName → 한글 (예: TFT17_Divine → 신성)
+    pub traits: HashMap<String, String>,
     pub trait_details: HashMap<String, TraitMeta>,  // 추가 (icon, breakpoints)
 }
 
@@ -223,4 +223,20 @@ impl Meta {
     pub fn trait_name(&self, id: &str) -> String {
         self.traits.get(id).cloned().unwrap_or_else(|| id.to_string())
     }
+}
+
+pub fn unit_icon(id: &str) -> String {
+    let asset = if let Some(rest) = id.strip_prefix("DA_18_") {
+        format!("TFT18_{rest}")
+    } else if let Some(rest) = id.strip_prefix("DA_") {
+        // DA_Vi18 / DA_Gromp18_AP — 이름 안의 18을 떼고 앞으로 옮긴다
+        format!("TFT18_{}", rest.replacen("18", "", 1))
+    } else {
+        id.to_string()
+    };
+
+    let low = asset.to_lowercase();
+    format!(
+        "https://raw.communitydragon.org/latest/game/assets/characters/{low}/{low}_square.png"
+    )
 }

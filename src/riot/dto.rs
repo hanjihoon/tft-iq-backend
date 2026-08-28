@@ -92,7 +92,7 @@ pub struct Participant {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trait {
-    pub name: String,            // "TFT17_SpaceGod" 같은 내부 id
+    pub name: String,         
     #[serde(rename = "num_units")]
     pub num_units: i32,
     /// 활성 등급 (예: 브론즈/실버/골드 → 1/2/3). 0이면 미활성.
@@ -106,7 +106,7 @@ pub struct Trait {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Unit {
     #[serde(rename = "character_id")]
-    pub character_id: String,    // "TFT17_Aphelios"
+    pub character_id: String,    
     /// 장착 아이템의 문자열 id. (items 정수배열은 사실상 deprecated)
     #[serde(rename = "itemNames", default)]
     pub item_names: Vec<String>,
@@ -120,19 +120,26 @@ impl Info {
         // "<Releases/16.12>" → "16.12"
         // "Version 17.5.123" → "17.5"
         let v = &self.game_version;
-        
-        // 숫자.숫자 패턴을 찾아서 추출
+
         let digits: Vec<&str> = v
             .split(|c: char| !c.is_ascii_digit() && c != '.')
             .filter(|s| s.contains('.') && !s.is_empty())
             .collect();
-        
+
         if let Some(ver) = digits.first() {
             let parts: Vec<&str> = ver.split('.').collect();
-            if parts.len() >= 2 {
+            // 앞 두 조각이 실제 숫자일 때만 유효한 패치로 인정한다.
+            if parts.len() >= 2
+                && !parts[0].is_empty()
+                && !parts[1].is_empty()
+            {
                 return format!("{}.{}", parts[0], parts[1]);
             }
         }
-        v.clone()
+
+        // Set 18은 언리얼 이전 직후 버전 문자열이 "TFT Unreal Version ?.?.?.?"로
+        // 비어서 온다. 패치를 못 얻으면 세트 번호로 대체해 파이프라인을 유지한다.
+        // Riot이 실제 버전을 채우기 시작하면 위 파싱이 다시 작동한다.
+        format!("{}.0", self.tft_set_number)
     }
 }

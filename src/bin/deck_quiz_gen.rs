@@ -19,8 +19,9 @@ use std::{collections::{HashMap, HashSet}, time::Instant};
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
 use tokio::task::JoinSet;
+use tft_iq::meta::unit_icon;
 
-const RAW_MIN_GAMES: i64 = 150;
+const RAW_MIN_GAMES: i64 = 50;
 const N_OPTIONS: usize = 4;
 const MAX_APPEAR_RATE: f64 = 0.30;
 /// 3성 비율이 이 값 미만이면 싣지 않는다.
@@ -43,16 +44,18 @@ async fn main() -> anyhow::Result<()> {
     };
     let (set_number, patch) = (info.set_number, info.patch.clone());
     eprintln!("대상: set {set_number}, patch {patch}");
- 
+
     let meta = Meta::load_with_lang(set_number, "ko_kr", false).await?;
+    eprintln!("meta 유닛 {}종, 특성 {}종", meta.units.len(), meta.traits.len());
 
-    let carry_items: HashMap<String, Vec<db::CarryTopItem>> =
-    db::load_carry_top_items(&pool).await?;
+    let carry_items = db::load_carry_top_items(&pool, &patch).await?;
+    eprintln!("carry_items {}종", carry_items.len());
 
-
-    // 덱별이 아니라 유닛별 — 리롤 유닛인지 판별용
     let star3 = db::load_unit_star3(&pool, set_number, &patch).await?;
+    eprintln!("star3 {}종", star3.len());
 
+    let unit_costs = db::unit_costs_from_matches(&pool, set_number).await?;
+    eprintln!("유닛 코스트 {}종", unit_costs.len());
 
     // 임시: 표본별 덱 수 확인
     for threshold in [50i64, 100, 150, 200] {
@@ -80,15 +83,10 @@ async fn main() -> anyhow::Result<()> {
     // 전체 티어덱에 등장하는 모든 유닛 = "메타 유닛 풀" (오답 후보)
     let meta_pool: Vec<String> = {
         let mut set: HashSet<String> = HashSet::new();
+        // raw_decks가 rarity 0~4(정규 챔피언)만 반환하므로 추가 필터는 불필요하다.
         for d in &tier_decks {
             for u in &d.units {
-                if u.starts_with("TFT17_")
-                    && !u.contains("Summon")
-                    && !u.contains("Minion")
-                    && !u.contains("follower")
-                {
-                    set.insert(u.clone());
-                }
+                set.insert(u.clone());
             }
         }
         set.into_iter().collect()
@@ -194,8 +192,8 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
 
             // 같은 코스트를 앞으로 (그럴듯한 오답)
-            let ans_cost = meta.unit_cost(removed, 0);
-            distractor_pool.sort_by_key(|u| (meta.unit_cost(u, 0) - ans_cost).abs());
+            let ans_cost = *unit_costs.get(removed).unwrap_or(&0);
+            distractor_pool.sort_by_key(|u| (unit_costs.get(u).unwrap_or(&0) - ans_cost).abs());
 
             let head = distractor_pool.len().min(10);
             distractor_pool[..head].shuffle(&mut rng);
@@ -283,25 +281,5 @@ async fn main() -> anyhow::Result<()> {
 
     pool.close().await;
     Ok(())
-}
-
-
-
-/// 유닛 아이콘 URL (Community Dragon). id 예: "TFT17_Karma".
-fn unit_icon(id: &str) -> String {
-    let low = id.to_lowercase();
-    let set = low
-        .trim_start_matches("tft")
-        .split('_')
-        .next()
-        .unwrap_or("");
-    // 파일명이 유닛 id와 다른 특수 유닛 (변신폼 등). 폴더는 id, 파일명만 예외.
-    let file_base: &str = match low.as_str() {
-        "tft17_rhaast" => "tft17_kayn_slay", // 라스트=케인 변신폼
-        other => other,
-    };
-    format!(
-        "https://raw.communitydragon.org/latest/game/assets/characters/{low}/hud/{file_base}_square.png"
-    )
 }
 

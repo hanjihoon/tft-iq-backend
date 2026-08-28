@@ -11,13 +11,18 @@ use tft_iq::{Config, db, riot::RiotClient};
 use tracing::{info, warn};
 
 /// 한 사이클에 처리할 플레이어 수
-const PLAYERS_PER_CYCLE: i64 = 200;
+const PLAYERS_PER_CYCLE: i64 = 1500;
 /// 티어별 사용할 최대 플레이어 수
 const MAX_PLAYERS_PER_TIER: usize = 500;
 /// 증분 조회 시 마지막 수집 시각에서 빼는 안전 마진(초). 막 끝난 게임 누락 방지.
 const CRAWL_MARGIN_SECS: i64 = 2 * 3600;
 /// 솔로랭크 큐 ID. 더블업(1160)·노말(1090)·기타 모드 저장 차단 → 통계 오염 + 용량 12% 절감
 const SOLO_QUEUE_ID: i32 = 1100;
+
+/// 이 시각 이전 매치는 요청하지 않는다.
+/// Set 18 출시(2026-08-26 00:00 KST = 2026-08-25 15:00 UTC) 기준.
+/// 세트 전환 시 옛 세트 매치를 긁느라 rate limit을 낭비하는 걸 막는다.
+const CRAWL_NOT_BEFORE: i64 = 1787670000;
 
 /// 표본 수 → 수집 티어. (crawler_dev와 동일 정책)
 fn tiers_for_sample(match_count: i64) -> &'static [&'static str] {
@@ -90,7 +95,11 @@ async fn main() -> anyhow::Result<()> {
         //   last_crawled 있으면 그 시각 - 마진 (증분)
         //   없으면 패치 시작 시각 (첫 수집 = 과거 백필)
         let last = db::player_last_crawled_epoch(&pool, puuid).await.unwrap_or(None);
-        let start_time = last.map(|t| t - CRAWL_MARGIN_SECS).or(patch_start);
+        let start_time = last
+            .map(|t| t - CRAWL_MARGIN_SECS)
+            .or(patch_start)
+            .map(|t| t.max(CRAWL_NOT_BEFORE))     // 어떤 경로든 하한 적용
+            .or(Some(CRAWL_NOT_BEFORE));          // 아무것도 없으면 하한부터
 
         match crawl_player(
             &riot, &pool, &cfg, puuid, start_time,
@@ -215,6 +224,13 @@ async fn crawl_player(
                 continue;
             }
         };
+
+        eprintln!("매치 {mid}: queue={}, set={}, raw_version={:?}, patch={}",
+            m.info.queue_id, m.info.tft_set_number, m.info.game_version, m.info.patch());
+        // 솔로랭크 체크 다음, 패치 체크 자리에
+        if m.info.tft_set_number != 18 {
+            continue;
+        }
 
         // ★ 솔로랭크만 저장. 더블업·노말이 섞이면 통계가 오염되고
         //   (실측 12%였음) 디스크도 낭비된다.

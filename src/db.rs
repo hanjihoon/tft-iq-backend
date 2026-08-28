@@ -8,7 +8,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
 
-const MIN_PATCH_MATCHES: i64 = 20000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
+const MIN_PATCH_MATCHES: i64 = 5000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
     let pool = PgPoolOptions::new()
@@ -398,7 +398,6 @@ pub async fn current_patch_info(pool: &PgPool) -> Result<Option<PatchInfo>> {
                match_count
         FROM patch_versions
         WHERE match_count >= $1
-        AND EXISTS (SELECT 1 FROM puzzles WHERE puzzles.patch = patch_versions.patch)
         ORDER BY earliest_game_datetime DESC NULLS LAST
         LIMIT 1
         "#,
@@ -875,22 +874,16 @@ pub async fn raw_decks(
         r#"
         SELECT deck, COUNT(*)::int8 AS games, ROUND(AVG(place), 2)::float8 AS avg_place
         FROM (
-          SELECT (p->>'placement')::int AS place,
-                 (SELECT string_agg(DISTINCT u->>'character_id', ',' ORDER BY u->>'character_id')
-                  FROM jsonb_array_elements(p->'units') u
-                  WHERE u->>'character_id' LIKE 'TFT17_%'
-                    AND u->>'character_id' NOT LIKE '%Summon%'
-                    AND u->>'character_id' NOT LIKE '%Minion%'
-                    AND u->>'character_id' NOT LIKE '%follower%') AS deck,
-                 (SELECT COUNT(DISTINCT u->>'character_id')
-                  FROM jsonb_array_elements(p->'units') u
-                  WHERE u->>'character_id' LIKE 'TFT17_%'
-                    AND u->>'character_id' NOT LIKE '%Summon%'
-                    AND u->>'character_id' NOT LIKE '%Minion%'
-                    AND u->>'character_id' NOT LIKE '%follower%') AS unit_count
-          FROM raw_matches m,
-               jsonb_array_elements(m.raw->'info'->'participants') AS p
-          WHERE m.patch = $1
+        SELECT (p->>'placement')::int AS place,
+                (SELECT string_agg(DISTINCT u->>'character_id', ',' ORDER BY u->>'character_id')
+                FROM jsonb_array_elements(p->'units') u
+                WHERE (u->>'rarity')::int BETWEEN 0 AND 4) AS deck,
+                (SELECT COUNT(DISTINCT u->>'character_id')
+                FROM jsonb_array_elements(p->'units') u
+                WHERE (u->>'rarity')::int BETWEEN 0 AND 4) AS unit_count
+        FROM raw_matches m,
+            jsonb_array_elements(m.raw->'info'->'participants') AS p
+        WHERE m.patch = $1
         ) sub
         WHERE unit_count = 8 AND deck IS NOT NULL
         GROUP BY deck
@@ -924,7 +917,7 @@ pub async fn unit_appearance_rates(
         FROM raw_matches m,
              jsonb_array_elements(m.raw->'info'->'participants') AS p,
              jsonb_array_elements(p->'units') AS u
-        WHERE m.patch = $1 AND u->>'character_id' LIKE 'TFT17_%'
+        WHERE COALESCE((u->>'rarity')::int, -1) BETWEEN 0 AND 4
         GROUP BY u->>'character_id'
         "#,
     )
@@ -1390,7 +1383,7 @@ pub async fn meta_decks(pool: &PgPool, patch: &str) -> Result<Vec<serde_json::Va
         .collect())
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CarryTopItem {
@@ -1403,7 +1396,8 @@ pub struct CarryTopItem {
 }
 
 pub async fn load_carry_top_items(
-    pool: &PgPool,
+    pool: &PgPool, 
+    patch: &str,
 ) -> Result<HashMap<String, Vec<CarryTopItem>>> {
     let rows = sqlx::query_as::<_, (String, String, String, String, f64, i64)>(
         r#"
@@ -1415,18 +1409,20 @@ pub async fn load_carry_top_items(
             (best_opt->>'avg_placement')::float8 AS avg,
             ord::bigint               AS ord
         FROM puzzles p,
-             LATERAL (
-                 SELECT s AS best_opt
-                 FROM jsonb_array_elements(p.stats->'options') s
-                 WHERE (s->>'is_best')::boolean = true
-                 LIMIT 1
-             ) b,
-             jsonb_array_elements(best_opt->'items') WITH ORDINALITY AS arr(item, ord)
+            LATERAL (
+                SELECT s AS best_opt
+                FROM jsonb_array_elements(p.stats->'options') s
+                WHERE (s->>'is_best')::boolean = true
+                LIMIT 1
+            ) b,
+            ROWS FROM (jsonb_array_elements(best_opt->'items')) WITH ORDINALITY AS arr(item, ord)
         WHERE p.puzzle_type = 'item_combine'
-          AND p.variant = 'main'
+        AND p.variant = 'main'
+        AND p.patch = $1
         ORDER BY carry_id, ord
         "#,
     )
+    .bind(patch)
     .fetch_all(pool).await?;
 
     // 캐리 id로 그룹핑
@@ -1606,10 +1602,6 @@ pub async fn load_unit_star3(pool: &PgPool, set_number: i32, patch: &str)
         FROM carry_stats
         WHERE set_number = $1 AND patch = $2
         AND carry_boards >= 50
-        AND carry_id LIKE 'TFT17!_%' ESCAPE '!'
-        AND carry_id NOT ILIKE '%summon%'
-        AND carry_id NOT ILIKE '%minion%'
-        AND carry_id NOT ILIKE '%follower%'
         "#,
     ).bind(set_number).bind(patch).fetch_all(pool).await?;
     Ok(rows.into_iter().collect())
@@ -1700,4 +1692,61 @@ pub async fn insert_deck_puzzles_batch(
         qb.build().execute(pool).await?;
     }
     Ok(())
+}
+
+/// 실제 매치에서 유닛이 장착한 아이템 id 집합.
+///
+/// cdragon items 배열에는 증강·상점 효과·역대 세트 아이템이 뒤섞여 있고
+/// id 규칙(DA_18_ 등)으로는 안정적으로 구분되지 않는다.
+/// "유닛이 실제로 낀 것"만 아이템으로 취급하면 세트가 바뀌어도 규칙을
+/// 다시 찾을 필요가 없다.
+///
+/// 주의: 세트 첫날처럼 매치가 없으면 빈 집합이 반환된다.
+pub async fn used_item_ids(
+    pool: &PgPool,
+    set_number: i32,
+) -> Result<HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT item
+        FROM raw_matches m,
+             jsonb_array_elements(m.raw->'info'->'participants') p,
+             jsonb_array_elements(p->'units') u,
+             jsonb_array_elements_text(u->'itemNames') item
+        WHERE m.set_number = $1
+        "#,
+    )
+    .bind(set_number)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 유닛별 코스트 (매치 데이터의 rarity + 1).
+///
+/// cdragon의 Set 18 유닛 데이터가 아직 채워지지 않아(2명뿐) 코스트를
+/// 얻을 수 없다. 매치 데이터의 rarity가 코스트-1과 일치하므로 이를 쓴다.
+/// cdragon이 채워지면 meta 쪽으로 되돌릴 수 있다.
+pub async fn unit_costs_from_matches(
+    pool: &PgPool,
+    set_number: i32,
+) -> Result<HashMap<String, i32>> {
+    let rows: Vec<(String, i32)> = sqlx::query_as(
+        r#"
+        SELECT u->>'character_id' AS unit_id,
+               MODE() WITHIN GROUP (ORDER BY (u->>'rarity')::int) + 1 AS cost
+        FROM raw_matches m,
+             jsonb_array_elements(m.raw->'info'->'participants') p,
+             jsonb_array_elements(p->'units') u
+        WHERE m.set_number = $1
+          AND (u->>'rarity')::int BETWEEN 0 AND 4
+        GROUP BY 1
+        "#,
+    )
+    .bind(set_number)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().collect())
 }

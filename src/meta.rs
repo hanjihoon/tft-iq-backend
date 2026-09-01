@@ -21,6 +21,7 @@ pub struct UnitMeta {
     pub cost: i32,
     pub traits: Vec<String>,
     pub ability: Option<SkillMeta>,
+    pub icon: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -98,99 +99,113 @@ impl Meta {
             }
         }
 
-        // 세트별 챔피언은 "setData" 배열에서 number로 찾는다.
-        // 세트별 챔피언 + 특성은 "setData" 배열에서 number로 찾는다.
         let mut units = HashMap::new();
         let mut traits = HashMap::new();
         let mut trait_details = HashMap::new();
-        if let Some(sets) = v.get("setData").and_then(|x| x.as_array()) {
-            for s in sets {
-                if s.get("number").and_then(|n| n.as_i64()) != Some(set_number as i64) {
-                    continue;
-                }
-                // 이 세트의 특성 한글명
-                if let Some(tr) = s.get("traits").and_then(|x| x.as_array()) {
-                    for t in tr {
-                        let (Some(id), Some(name)) = (
-                            t.get("apiName").and_then(|x| x.as_str()),
-                            t.get("name").and_then(|x| x.as_str()),
-                        ) else {
-                            continue;
-                        };
-                        if !name.is_empty() {
-                            traits.insert(id.to_string(), name.to_string());
-                        }
 
+        // cdragon은 세트 데이터를 setData(배열)와 sets(객체) 두 곳에 담는데
+        // 어느 쪽에 들어가는지 일정하지 않다. Set 18은 sets에만 있고
+        // setData에는 과거 세트의 특수 모드만 남아 있다. 둘 다 확인한다.
+        let mut set_entries: Vec<&serde_json::Value> = Vec::new();
 
-                        // 추가: trait_details (icon, breakpoints)
-                        let icon = trait_icon_url(t.get("icon").and_then(|x| x.as_str()).unwrap_or(""));
-                        let breakpoints: Vec<(i32, i32)> = t.get("effects")
-                            .and_then(|e| e.as_array())
-                            .map(|arr| arr.iter().filter_map(|e| {
-                                let min = e.get("minUnits")?.as_i64()? as i32;
-                                let style = e.get("style")?.as_i64()? as i32;
-                                Some((min, style))
-                            }).collect())
-                            .unwrap_or_default();
-
-                        let desc = t.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let effects = t.get("effects").cloned().unwrap_or(serde_json::json!([]));
-
-                        trait_details.insert(id.to_string(), TraitMeta {
-                            name: name.to_string(),
-                            icon,
-                            breakpoints,
-                            desc,
-                            effects,
-                        });
-                    }
-                }
-                if let Some(champs) = s.get("champions").and_then(|c| c.as_array()) {
-                    for c in champs {
-                        let (Some(id), Some(name)) = (
-                            c.get("apiName").and_then(|x| x.as_str()),
-                            c.get("name").and_then(|x| x.as_str()),
-                        ) else {
-                            continue;
-                        };
-
-                        // traits(apiName → 한글)가 이미 채워진 후, 역매핑 생성
-                        let name_to_api: HashMap<String, String> = traits.iter()
-                            .map(|(api, name)| (name.clone(), api.clone()))
-                            .collect();
-
-                        // 유닛 파싱 루프에서 traits를 apiName으로
-                        let trait_names: Vec<String> = c.get("traits")
-                            .and_then(|t| t.as_array())
-                            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-
-                        // 한글 → apiName 변환
-                        let trait_apis: Vec<String> = trait_names.iter()
-                            .filter_map(|kr| name_to_api.get(kr).cloned())
-                            .collect();
-
-                        let cost = c.get("cost").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-
-                        // 스킬(ability) 파싱
-                        let ability = c.get("ability").and_then(|ab| {
-                            let name = ab.get("name").and_then(|x| x.as_str())?.to_string();
-                            let desc = ab.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            let icon_raw = ab.get("icon").and_then(|x| x.as_str()).unwrap_or("");
-                            let icon = skill_icon_url(icon_raw);
-                            let variables = ab.get("variables").cloned().unwrap_or(serde_json::json!([]));
-                            Some(SkillMeta { name, icon, desc, variables })
-                        });
-
-                        units.insert(
-                            id.to_string(),
-                            UnitMeta { name: name.to_string(), cost, traits: trait_apis, ability },
-                        );
-                    }
+        if let Some(arr) = v.get("setData").and_then(|x| x.as_array()) {
+            for s in arr {
+                if s.get("number").and_then(|n| n.as_i64()) == Some(set_number as i64) {
+                    set_entries.push(s);
                 }
             }
         }
+        if let Some(obj) = v.get("sets").and_then(|x| x.as_object()) {
+            if let Some(s) = obj.get(&set_number.to_string()) {
+                set_entries.push(s);
+            }
+        }
 
+        for s in set_entries {
+            // 이 세트의 특성 한글명
+            if let Some(tr) = s.get("traits").and_then(|x| x.as_array()) {
+                for t in tr {
+                    let (Some(id), Some(name)) = (
+                        t.get("apiName").and_then(|x| x.as_str()),
+                        t.get("name").and_then(|x| x.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    if !name.is_empty() {
+                        traits.insert(id.to_string(), name.to_string());
+                    }
+
+                    let icon = trait_icon_url(t.get("icon").and_then(|x| x.as_str()).unwrap_or(""));
+                    let breakpoints: Vec<(i32, i32)> = t.get("effects")
+                        .and_then(|e| e.as_array())
+                        .map(|arr| arr.iter().filter_map(|e| {
+                            let min = e.get("minUnits")?.as_i64()? as i32;
+                            let style = e.get("style")?.as_i64()? as i32;
+                            Some((min, style))
+                        }).collect())
+                        .unwrap_or_default();
+
+                    let desc = t.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let effects = t.get("effects").cloned().unwrap_or(serde_json::json!([]));
+
+                    trait_details.insert(id.to_string(), TraitMeta {
+                        name: name.to_string(),
+                        icon,
+                        breakpoints,
+                        desc,
+                        effects,
+                    });
+                }
+            }
+
+            if let Some(champs) = s.get("champions").and_then(|c| c.as_array()) {
+                // 한글 특성명 → apiName 역매핑. 위에서 traits를 다 채운 뒤 한 번만 만든다.
+                let name_to_api: HashMap<String, String> = traits.iter()
+                    .map(|(api, name)| (name.clone(), api.clone()))
+                    .collect();
+
+                for c in champs {
+                    let (Some(id), Some(name)) = (
+                        c.get("apiName").and_then(|x| x.as_str()),
+                        c.get("name").and_then(|x| x.as_str()),
+                    ) else {
+                        continue;
+                    };
+
+                    let trait_names: Vec<String> = c.get("traits")
+                        .and_then(|t| t.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+
+                    let trait_apis: Vec<String> = trait_names.iter()
+                        .filter_map(|kr| name_to_api.get(kr).cloned())
+                        .collect();
+
+                    let cost = c.get("cost").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+
+                    let ability = c.get("ability").and_then(|ab| {
+                        let name = ab.get("name").and_then(|x| x.as_str())?.to_string();
+                        let desc = ab.get("desc").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let icon_raw = ab.get("icon").and_then(|x| x.as_str()).unwrap_or("");
+                        let icon = skill_icon_url(icon_raw);
+                        let variables = ab.get("variables").cloned().unwrap_or(serde_json::json!([]));
+                        Some(SkillMeta { name, icon, desc, variables })
+                    });
+
+                    let tile_icon = c.get("tileIcon").and_then(|x| x.as_str())
+                        .map(cdragon_icon_url)
+                        .unwrap_or_default();
+
+                    units.insert(id.to_string(), UnitMeta {
+                        name: name.to_string(),
+                        cost,
+                        traits: trait_apis,
+                        ability,
+                        icon: tile_icon,     // UnitMeta에 필드 추가 필요
+                    });
+                }
+            }
+        }
 
         Ok(Self {
             augments,
@@ -225,18 +240,11 @@ impl Meta {
     }
 }
 
-pub fn unit_icon(id: &str) -> String {
-    let asset = if let Some(rest) = id.strip_prefix("DA_18_") {
-        format!("TFT18_{rest}")
-    } else if let Some(rest) = id.strip_prefix("DA_") {
-        // DA_Vi18 / DA_Gromp18_AP — 이름 안의 18을 떼고 앞으로 옮긴다
-        format!("TFT18_{}", rest.replacen("18", "", 1))
-    } else {
-        id.to_string()
-    };
-
-    let low = asset.to_lowercase();
+/// cdragon 에셋 경로 → 실제 이미지 URL.
+/// 아이템·유닛·특성 모두 같은 규칙이다.
+pub fn cdragon_icon_url(path: &str) -> String {
     format!(
-        "https://raw.communitydragon.org/latest/game/assets/characters/{low}/{low}_square.png"
+        "https://raw.communitydragon.org/latest/game/{}",
+        path.to_lowercase().replace(".tex", ".png").replace(".dds", ".png")
     )
 }

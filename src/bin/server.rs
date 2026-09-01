@@ -24,7 +24,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
-use tft_iq::meta::unit_icon;
+use tft_iq::meta::cdragon_icon_url;
 
 #[derive(Clone)]
 struct AppState {
@@ -359,62 +359,35 @@ async fn meta_decks_handler(
     Ok(Json(decks))
 }
 
+/// 유닛 메타 (이름·코스트·특성·아이콘·스킬).
+///
+/// cdragon json이 언어당 수 MB라 요청마다 받으면 10초 이상 걸린다.
+/// meta_sync가 DB에 적재해두고 여기서는 DB만 읽는다.
 async fn meta_units_handler(
     Query(q): Query<MetaQuery>,
     State(st): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let patch = match db::current_patch_info(&st.pool).await? {
-        Some(info) => info,
-        None => return Ok(Json(serde_json::json!({}))),
+    let Some(info) = db::current_patch_info(&st.pool).await? else {
+        return Ok(Json(serde_json::json!({})));
     };
     let lang = validate_lang(&q.lang.unwrap_or_else(|| "ko_kr".into()));
-    let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
 
-    // cdragon이 아직 Set 18 유닛을 채우지 않아 meta.units가 부실하다.
-    // 매치에 실제로 등장한 유닛을 기준으로 삼고, 이름·특성은 meta에서
-    // 있으면 채우고 없으면 id를 그대로 쓴다.
-    let costs = db::unit_costs_from_matches(&st.pool, patch.set_number).await?;
-
-    let mut info = serde_json::Map::new();
-    for (id, cost) in &costs {
-        let m = meta.units.get(id);
-        info.insert(id.clone(), serde_json::json!({
-            "name":   m.map(|u| u.name.clone()).unwrap_or_else(|| id.clone()),
-            "cost":   m.map(|u| u.cost).unwrap_or(*cost),
-            "traits": m.map(|u| u.traits.clone()).unwrap_or_default(),
-            "ability": m.map(|u| serde_json::json!(u.ability)).unwrap_or(serde_json::Value::Null),
-            "icon":   unit_icon(id),
-        }));
-    }
-
-    Ok(Json(serde_json::Value::Object(info)))
+    let units = db::load_unit_meta_json(&st.pool, info.set_number, &lang).await?;
+    Ok(Json(units))
 }
 
+/// 특성 메타 (이름·아이콘·단계·설명).
 async fn meta_traits_handler(
     Query(q): Query<MetaQuery>,
     State(st): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let patch = match db::current_patch_info(&st.pool).await? {
-        Some(info) => info,
-        None => return Ok(Json(serde_json::json!({}))),
+    let Some(info) = db::current_patch_info(&st.pool).await? else {
+        return Ok(Json(serde_json::json!({})));
     };
-    let lang = q.lang.unwrap_or_else(|| "ko_kr".into());
-    // 언어 화이트리스트 (안전 — 아무 문자열이나 URL에 넣으면 위험)
-    let lang = validate_lang(&lang);
-    let meta = Meta::load_with_lang(patch.set_number, &lang, false).await?;
+    let lang = validate_lang(&q.lang.unwrap_or_else(|| "ko_kr".into()));
 
-    // 한글명 키로 맵 구성 (프론트 유닛 traits가 한글명이라 매칭 편함)
-    let mut out = serde_json::Map::new();
-    for (api, t) in meta.trait_details.iter() {  // api = apiName
-        out.insert(api.clone(), serde_json::json!({
-            "name": t.name,      // 이름 추가! (프론트가 표시용)
-            "icon": t.icon,
-            "breakpoints": t.breakpoints,
-            "desc": t.desc,
-            "effects": t.effects,
-        }));
-    }
-    Ok(Json(serde_json::Value::Object(out)))
+    let traits = db::load_trait_meta_json(&st.pool, info.set_number, &lang).await?;
+    Ok(Json(traits))
 }
 
 async fn meta_items_handler(

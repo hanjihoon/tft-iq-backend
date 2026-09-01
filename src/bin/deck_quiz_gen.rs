@@ -19,9 +19,11 @@ use std::{collections::{HashMap, HashSet}, time::Instant};
 use rand::seq::SliceRandom;
 use tft_iq::{db, meta::Meta, Config};
 use tokio::task::JoinSet;
-use tft_iq::meta::unit_icon;
+use tft_iq::meta::cdragon_icon_url;
 
-const RAW_MIN_GAMES: i64 = 50;
+const MIN_DECK_GAMES_RATE: f64 = 0.005;
+const MIN_DECK_GAMES_FLOOR: i64 = 30;
+const RAW_MIN_GAMES: i64 = 100;
 const N_OPTIONS: usize = 4;
 const MAX_APPEAR_RATE: f64 = 0.30;
 /// 3성 비율이 이 값 미만이면 싣지 않는다.
@@ -57,11 +59,16 @@ async fn main() -> anyhow::Result<()> {
     let unit_costs = db::unit_costs_from_matches(&pool, set_number).await?;
     eprintln!("유닛 코스트 {}종", unit_costs.len());
 
-    // 임시: 표본별 덱 수 확인
-    for threshold in [50i64, 100, 150, 200] {
-        let d = db::raw_decks(&pool, &patch, threshold).await?;
+    let total_matches = db::current_patch_match_count(&pool).await?;
+    let min_deck_games = ((total_matches as f64 * MIN_DECK_GAMES_RATE) as i64)
+        .max(MIN_DECK_GAMES_FLOOR);
+    eprintln!("매치 {total_matches}건 → 덱 표본 임계 {min_deck_games}판");
+
+    // 임계 감각 확인용 — 계산값 주변을 훑어본다
+    for m in [min_deck_games / 2, min_deck_games, min_deck_games * 2] {
+        let d = db::raw_decks(&pool, &patch, m).await?;
         let valid = d.iter().filter(|x| x.avg_placement <= 5.0).count();
-        eprintln!("{}판 이상 + avg5이하: {} 덱 (전체 {})", threshold, valid, d.len());
+        eprintln!("{m}판 이상 + avg5이하: {valid}덱 (전체 {})", d.len());
     }
 
     let t0 = Instant::now();
@@ -207,11 +214,14 @@ async fn main() -> anyhow::Result<()> {
             option_ids.extend(distractors);
             option_ids.shuffle(&mut rng);
 
+            let unit_icons: HashMap<String, String> = db::load_unit_icons(&pool, set_number, "ko_kr").await?;
+            let icon_of = |id: &str| unit_icons.get(id).cloned().unwrap_or_default();
+
             let options: Vec<serde_json::Value> = option_ids.iter()
                 .map(|id| serde_json::json!({
                     "id": id,
                     "name": meta.unit_name(id),
-                    "icon": unit_icon(id),
+                    "icon": icon_of(id),
                 }))
                 .collect();
 
@@ -219,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|id| serde_json::json!({
                     "id": id,
                     "name": meta.unit_name(id),
-                    "icon": unit_icon(id),
+                    "icon": icon_of(id),
                 }))
                 .collect();
 
@@ -251,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
             let stats = serde_json::json!({
                 "deck_avg": deck.avg_placement,
                 "deck_games": deck.games,
-                "answer": { "id": removed, "name": meta.unit_name(removed), "icon": unit_icon(removed) },
+                "answer": { "id": removed, "name": meta.unit_name(removed), "icon": cdragon_icon_url(removed) },
                 "options": option_ids.iter().map(|id| serde_json::json!({
                     "id": id, "name": meta.unit_name(id), "is_best": id == removed,
                 })).collect::<Vec<_>>(),

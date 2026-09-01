@@ -8,10 +8,10 @@ use tft_iq::{
     puzzle::{ItemOptionStat, ItemPrompt, NamedRef, OptionItem},
 };
 
-const MIN_CARRY_APPEARANCES: i64 = 30;
+const MIN_CARRY_APPEARANCES: i64 = 50;
 const SHRINK_C: f64 = 25.0; // 수축 강도 (가상 사전표본 개수)
 const MIN_LIFT: f64 = 2.0;    // 풀템 기준 lift. 이 미만은 범용템 → 제외
-const MIN_ITEM_PICKS: i64 = 30;
+const MIN_ITEM_PICKS: i64 = 50;
 
 
 fn adjusted(avg: f64, picks: i64, prior_mean: f64) -> f64 {

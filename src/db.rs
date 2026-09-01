@@ -6,7 +6,7 @@ use crate::riot::dto::Match;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
-
+use crate::meta::Meta;
 
 const MIN_PATCH_MATCHES: i64 = 5000; // 이 매치 수 넘어야 "현재 패치"로 전환 (자동 지연)
 
@@ -1748,5 +1748,183 @@ pub async fn unit_costs_from_matches(
     .fetch_all(pool)
     .await?;
 
+    Ok(rows.into_iter().collect())
+}
+
+pub async fn upsert_unit_meta(
+    pool: &PgPool, set_number: i32, lang: &str, meta: &Meta,
+) -> Result<()> {
+    const BATCH: usize = 200;
+    let entries: Vec<_> = meta.units.iter().collect();
+
+    for chunk in entries.chunks(BATCH) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO unit_meta \
+             (set_number, lang, unit_id, name, cost, traits, icon_url, \
+              skill_name, skill_icon, skill_desc, skill_vars) "
+        );
+        qb.push_values(chunk, |mut b, (id, u)| {
+            let (sn, si, sd, sv) = match &u.ability {
+                Some(a) => (a.name.clone(), a.icon.clone(), a.desc.clone(), Some(a.variables.clone())),
+                None => (String::new(), String::new(), String::new(), None),
+            };
+            b.push_bind(set_number)
+             .push_bind(lang)
+             .push_bind(id.as_str())
+             .push_bind(u.name.as_str())
+             .push_bind(u.cost)
+             .push_bind(u.traits.clone())
+             .push_bind(u.icon.as_str())
+             .push_bind(sn).push_bind(si).push_bind(sd).push_bind(sv);
+        });
+        qb.push(
+            " ON CONFLICT (set_number, lang, unit_id) DO UPDATE SET \
+              name = EXCLUDED.name, cost = EXCLUDED.cost, traits = EXCLUDED.traits, \
+              icon_url = EXCLUDED.icon_url, skill_name = EXCLUDED.skill_name, \
+              skill_icon = EXCLUDED.skill_icon, skill_desc = EXCLUDED.skill_desc, \
+              skill_vars = EXCLUDED.skill_vars"
+        );
+        qb.build().execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub async fn upsert_trait_meta(
+    pool: &PgPool, set_number: i32, lang: &str, meta: &Meta,
+) -> Result<()> {
+    const BATCH: usize = 200;
+    let entries: Vec<_> = meta.trait_details.iter().collect();
+
+    for chunk in entries.chunks(BATCH) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO trait_meta \
+             (set_number, lang, trait_id, name, icon_url, description, breakpoints, effects) "
+        );
+        qb.push_values(chunk, |mut b, (id, t)| {
+            let bps = serde_json::json!(t.breakpoints);
+            b.push_bind(set_number)
+             .push_bind(lang)
+             .push_bind(id.as_str())
+             .push_bind(t.name.as_str())
+             .push_bind(t.icon.as_str())
+             .push_bind(t.desc.as_str())
+             .push_bind(bps)
+             .push_bind(t.effects.clone());
+        });
+        qb.push(
+            " ON CONFLICT (set_number, lang, trait_id) DO UPDATE SET \
+              name = EXCLUDED.name, icon_url = EXCLUDED.icon_url, \
+              description = EXCLUDED.description, breakpoints = EXCLUDED.breakpoints, \
+              effects = EXCLUDED.effects"
+        );
+        qb.build().execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub async fn load_unit_meta_json(
+    pool: &PgPool, set_number: i32, lang: &str,
+) -> Result<serde_json::Value> {
+    let rows: Vec<(String, String, i32, Vec<String>, String, String, String, String, Option<serde_json::Value>)> =
+        sqlx::query_as(
+            r#"
+            SELECT unit_id, name, cost, traits, icon_url,
+                   skill_name, skill_icon, skill_desc, skill_vars
+            FROM unit_meta
+            WHERE set_number = $1 AND lang = $2
+            "#,
+        )
+        .bind(set_number).bind(lang)
+        .fetch_all(pool).await?;
+
+    let mut map = serde_json::Map::new();
+    for (id, name, cost, traits, icon, sn, si, sd, sv) in rows {
+        let ability = if sn.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({ "name": sn, "icon": si, "desc": sd, "variables": sv })
+        };
+        map.insert(id, serde_json::json!({
+            "name": name, "cost": cost, "traits": traits,
+            "icon": icon, "ability": ability,
+        }));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+pub struct UnitMetaRow {
+    pub unit_id: String,
+    pub name: String,
+    pub traits: Vec<String>,   // 특성 apiName 목록
+    pub icon: String,
+}
+
+pub async fn load_trait_meta_json(
+    pool: &PgPool, set_number: i32, lang: &str,
+) -> Result<serde_json::Value> {
+    let rows: Vec<(String, String, String, String, Option<serde_json::Value>, Option<serde_json::Value>)> =
+        sqlx::query_as(
+            r#"
+            SELECT trait_id, name, icon_url, description, breakpoints, effects
+            FROM trait_meta
+            WHERE set_number = $1 AND lang = $2
+            "#,
+        )
+        .bind(set_number).bind(lang)
+        .fetch_all(pool).await?;
+
+    let mut map = serde_json::Map::new();
+    for (id, name, icon, description, breakpoints, effects) in rows {
+        map.insert(id, serde_json::json!({
+            "name": name,
+            "icon": icon,
+            "desc": description,
+            "breakpoints": breakpoints,
+            "effects": effects,
+        }));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// 특성 퀴즈 생성용 유닛 목록. unit_meta에서 특성을 가진 유닛만.
+pub async fn units_for_trait_quiz(
+    pool: &PgPool, set_number: i32, lang: &str,
+) -> Result<Vec<UnitMetaRow>> {
+    let rows: Vec<(String, String, Vec<String>, String)> = sqlx::query_as(
+        r#"
+        SELECT unit_id, name, traits, icon_url
+        FROM unit_meta
+        WHERE set_number = $1 AND lang = $2
+          AND array_length(traits, 1) > 0
+        "#,
+    )
+    .bind(set_number).bind(lang)
+    .fetch_all(pool).await?;
+
+    Ok(rows.into_iter()
+        .map(|(unit_id, name, traits, icon)| UnitMetaRow { unit_id, name, traits, icon })
+        .collect())
+}
+
+
+/// 오답 풀용 전체 특성 id 목록.
+pub async fn all_trait_ids(
+    pool: &PgPool, set_number: i32, lang: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT trait_id FROM trait_meta WHERE set_number = $1 AND lang = $2",
+    )
+    .bind(set_number).bind(lang)
+    .fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+pub async fn load_unit_icons(
+    pool: &PgPool, set_number: i32, lang: &str,
+) -> Result<HashMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT unit_id, icon_url FROM unit_meta WHERE set_number = $1 AND lang = $2",
+    )
+    .bind(set_number).bind(lang)
+    .fetch_all(pool).await?;
     Ok(rows.into_iter().collect())
 }

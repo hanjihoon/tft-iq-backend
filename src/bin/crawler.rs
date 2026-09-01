@@ -11,7 +11,7 @@ use tft_iq::{Config, db, riot::RiotClient};
 use tracing::{info, warn};
 
 /// 한 사이클에 처리할 플레이어 수
-const PLAYERS_PER_CYCLE: i64 = 1500;
+const PLAYERS_PER_CYCLE: i64 = 500;
 /// 티어별 사용할 최대 플레이어 수
 const MAX_PLAYERS_PER_TIER: usize = 500;
 /// 증분 조회 시 마지막 수집 시각에서 빼는 안전 마진(초). 막 끝난 게임 누락 방지.

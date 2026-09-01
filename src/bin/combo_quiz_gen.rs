@@ -6,7 +6,7 @@ use tft_iq::{
     meta::Meta,
 };
 
-const MIN_TOTAL_APPEARANCES: i64 = 5000;
+const MIN_APPEAR_RATE: f64 = 0.33;
 const MIN_COMBO_PICKS: i64 = 50;
 const MIN_COMBOS_NEEDED: usize = 6; // 문제1(1~4) + 변형(3~6) = 최소 6개
 const SHRINK_C: f64 = 25.0;         // 베이지안 수축 강도 (기존 계승)
@@ -152,13 +152,17 @@ async fn main() -> anyhow::Result<()> {
     let (set_number, patch) = (info.set_number, info.patch.clone());
     eprintln!("대상: set {set_number}, patch {patch}");
 
+    let total_matches = db::current_patch_match_count(&pool).await?;
+    let min_appearances = (total_matches as f64 * MIN_APPEAR_RATE) as i64;
+    eprintln!("매치 {total_matches}건 → 등장 임계 {min_appearances}");
+
     let meta = Meta::load_with_lang(set_number, "ko_kr", false).await?;
     let item_map = db::all_item_info(&pool).await?;
     eprintln!("아이템 정보 {}종 로드", item_map.len());
     
 
     let carries =
-        db::carry_list_for_combo(&pool, set_number, &patch, MIN_TOTAL_APPEARANCES).await?;
+        db::carry_list_for_combo(&pool, set_number, &patch, min_appearances).await?;
     eprintln!("캐리 후보 {}종", carries.len());
 
     let mut made = 0;
